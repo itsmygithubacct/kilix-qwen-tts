@@ -1,0 +1,35 @@
+{
+  "expected_error": "CONSENT_REQUIRED",
+  "request": {
+    "schema": "kilix.qwen-tts.provider/candidate-v1",
+    "type": "request",
+    "request_id": "bad-002",
+    "op": "submit",
+    "job_id": "bad-job-002",
+    "deadline_ms": 10000,
+    "args": {
+      "task": "synthesize",
+      "text": "missing consent",
+      "model_id": "candidate-clone",
+      "language": "en",
+      "seed": 2,
+      "max_duration_ms": 1000,
+      "mode": "prompt_clone",
+      "prompt_fd": 0,
+      "prompt_audio": {
+        "sample_format": "s16le",
+        "sample_rate_hz": 24000,
+        "channels": 1,
+        "duration_ms": 1000,
+        "frame_count": 24000,
+        "byte_length": 48000,
+        "sha256": "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+      },
+      "output": {
+        "sample_format": "s16le",
+        "sample_rate_hz": 24000,
+        "channels": 1
+      }
+    }
+  }
+}

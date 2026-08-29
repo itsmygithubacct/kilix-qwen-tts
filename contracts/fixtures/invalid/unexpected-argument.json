@@ -1,0 +1,27 @@
+{
+  "expected_error": "INVALID_REQUEST",
+  "request": {
+    "schema": "kilix.qwen-tts.provider/candidate-v1",
+    "type": "request",
+    "request_id": "bad-006",
+    "op": "submit",
+    "job_id": "bad-job-006",
+    "deadline_ms": 10000,
+    "args": {
+      "task": "synthesize",
+      "text": "unexpected argument",
+      "model_id": "candidate-lightweight",
+      "language": "en",
+      "seed": 4,
+      "max_duration_ms": 1000,
+      "mode": "named_voice",
+      "voice_id": "voice_1",
+      "temperature": 0.7,
+      "output": {
+        "sample_format": "s16le",
+        "sample_rate_hz": 24000,
+        "channels": 1
+      }
+    }
+  }
+}

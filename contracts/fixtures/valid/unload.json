@@ -1,0 +1,8 @@
+{
+  "schema": "kilix.qwen-tts.provider/candidate-v1",
+  "type": "request",
+  "request_id": "req-unload-001",
+  "op": "unload",
+  "deadline_ms": 5000,
+  "args": {}
+}

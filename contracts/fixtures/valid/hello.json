@@ -1,0 +1,14 @@
+{
+  "schema": "kilix.qwen-tts.provider/candidate-v1",
+  "type": "request",
+  "request_id": "req-hello-001",
+  "op": "hello",
+  "deadline_ms": 5000,
+  "args": {
+    "protocol_major": 1,
+    "protocol_minor": 0,
+    "max_control_frame_bytes": 65536,
+    "max_audio_chunk_bytes": 192000,
+    "max_descriptors_per_message": 1
+  }
+}

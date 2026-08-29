@@ -1,0 +1,27 @@
+{
+  "expected_error": "INVALID_REQUEST",
+  "request": {
+    "schema": "kilix.qwen-tts.provider/candidate-v1",
+    "type": "request",
+    "request_id": "bad-005",
+    "op": "submit",
+    "job_id": "bad-job-005",
+    "deadline_ms": 10000,
+    "args": {
+      "task": "synthesize",
+      "text": "cross-mode argument",
+      "model_id": "candidate-lightweight",
+      "language": "en",
+      "seed": 3,
+      "max_duration_ms": 1000,
+      "mode": "named_voice",
+      "voice_id": "voice_1",
+      "description": "This field belongs only to voice design.",
+      "output": {
+        "sample_format": "s16le",
+        "sample_rate_hz": 24000,
+        "channels": 1
+      }
+    }
+  }
+}

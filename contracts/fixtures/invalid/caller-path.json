@@ -1,0 +1,27 @@
+{
+  "expected_error": "FORBIDDEN_FIELD",
+  "request": {
+    "schema": "kilix.qwen-tts.provider/candidate-v1",
+    "type": "request",
+    "request_id": "bad-001",
+    "op": "submit",
+    "job_id": "bad-job-001",
+    "deadline_ms": 10000,
+    "args": {
+      "task": "synthesize",
+      "text": "unsafe output",
+      "model_id": "candidate-lightweight",
+      "language": "en",
+      "seed": 1,
+      "max_duration_ms": 1000,
+      "mode": "named_voice",
+      "voice_id": "voice_1",
+      "path": "/tmp/output.wav",
+      "output": {
+        "sample_format": "s16le",
+        "sample_rate_hz": 24000,
+        "channels": 1
+      }
+    }
+  }
+}

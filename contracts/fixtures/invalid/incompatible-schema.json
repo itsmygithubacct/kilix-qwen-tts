@@ -1,0 +1,11 @@
+{
+  "expected_error": "INCOMPATIBLE_PROTOCOL",
+  "request": {
+    "schema": "kilix.qwen-tts.provider/v2",
+    "type": "request",
+    "request_id": "bad-003",
+    "op": "models",
+    "deadline_ms": 1000,
+    "args": {}
+  }
+}

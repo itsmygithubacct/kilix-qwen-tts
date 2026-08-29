@@ -1,0 +1,11 @@
+{
+  "expected_error": "UNKNOWN_OPERATION",
+  "request": {
+    "schema": "kilix.qwen-tts.provider/candidate-v1",
+    "type": "request",
+    "request_id": "bad-004",
+    "op": "download",
+    "deadline_ms": 1000,
+    "args": {}
+  }
+}

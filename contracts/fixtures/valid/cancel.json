@@ -1,0 +1,9 @@
+{
+  "schema": "kilix.qwen-tts.provider/candidate-v1",
+  "type": "request",
+  "request_id": "req-004",
+  "op": "cancel",
+  "job_id": "job-003",
+  "deadline_ms": 5000,
+  "args": {}
+}

@@ -1,0 +1,27 @@
+{
+  "schema": "kilix.qwen-tts.provider/candidate-v1",
+  "type": "request",
+  "request_id": "req-003",
+  "op": "submit",
+  "job_id": "job-003",
+  "deadline_ms": 180000,
+  "args": {
+    "task": "synthesize",
+    "text": "A designed voice request.",
+    "model_id": "candidate-design",
+    "language": "en-GB",
+    "instruction": "Keep delivery calm and measured.",
+    "seed": 13,
+    "max_duration_ms": 45000,
+    "mode": "voice_design",
+    "description": "A clear low voice with restrained pacing.",
+    "output": {
+      "sample_format": "s16le",
+      "sample_rate_hz": 24000,
+      "channels": 1
+    }
+  },
+  "extensions": {
+    "x_review_marker": "ignored"
+  }
+}
