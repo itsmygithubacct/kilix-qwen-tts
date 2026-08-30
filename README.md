@@ -1,14 +1,15 @@
 # kilix-qwen-tts
 
-This repository contains the PREP7 provider-interface candidate and a CONT3
-engine-neutral implementation surface for the local Qwen3-TTS service planned
-by Plebian OS / Kilix 0.2.1.
+This repository contains a focused, not-frozen provider-interface candidate and
+an engine-neutral implementation surface for the local Qwen3-TTS service
+planned by Plebian OS / Kilix 0.2.1. It is a successor review subject, not the
+rejected PREP7 package and not a continuation package named CONT3.
 
 The candidate defines a bounded Unix-socket job surface for streaming
 synthesis without selecting a model, runtime, content artifact, device
-profile, or release package. It is deliberately reviewable before the F104 P1
-entry dependencies arrive, but it is not the frozen P1 contract and it is not
-a working speech provider.
+profile, or release package. It is reviewable without retrying the F100 or F106
+gates, but it is not the frozen P1 contract and it is not a working speech
+provider.
 
 The required command population is 6/6:
 
@@ -29,13 +30,20 @@ The standard-library implementation under `src/kilix_qwen_tts/` supplies only
 gate-independent mechanics:
 
 - 4/4 bounded mono PCM format/rate combinations;
-- ordered chunk assembly with byte, frame, and duration limits;
+- ordered chunk assembly with byte, frame, descriptor, digest, population, and
+  duration limits;
 - deterministic 2/2 RIFF/WAVE encodings for signed 16-bit PCM and 32-bit IEEE
   float PCM;
-- exact prompt-metadata and consent-digest binding for 1/1 clone path;
+- actual prompt-byte, descriptor-count, consent-digest, peer-UID, model-ID,
+  model-revision, job-ID, and result-provenance binding for 1/1 clone path;
 - a 7/7-state cancellable job lifecycle with at most 1/1 terminal result; and
 - static `models` and `status` output with 0/2 Qwen model lines, 0/2 release
   tier slots, and 0/3 synthesis modes selected.
+
+The request validator also bounds 1/1 control frame by byte size, nesting
+depth, node population, and key size before recursively inspecting forbidden
+fields. Oversized raw frames, invalid UTF-8, duplicate object keys, non-finite
+JSON numbers, and impossible UTC consent dates are refused.
 
 All 4/4 runtime-bearing commands fail closed with exit status 69 and the exact
 provider refusal:
@@ -51,8 +59,8 @@ make check
 ```
 
 That command validates all 6/6 operation request shapes, 19/19 declared error
-codes, 8/8 valid fixtures, 6/6 refusal fixtures, 10/10 implementation mutation
-controls, and 44/44 unit tests using only Python's standard library.
+codes, 8/8 valid fixtures, 6/6 refusal fixtures, 13/13 implementation mutation
+controls, and 69/69 unit tests using only Python's standard library.
 
 ## Boundary
 
@@ -65,6 +73,10 @@ This candidate does not:
 - download content, accept caller-selected paths or URLs, or execute caller
   strings;
 - authorize a remote, push, tag, package, or release claim.
+
+The implementation's `SurfaceError` reasons are internal invariant labels,
+not the 19/19 wire error vocabulary. A P1 protocol adapter and its explicit
+internal-to-wire mapping remain 0/1 implemented.
 
 The exact executable candidate is
 [`contracts/provider-interface-candidate-v1.json`](contracts/provider-interface-candidate-v1.json).

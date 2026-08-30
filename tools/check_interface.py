@@ -1,11 +1,13 @@
 #!/usr/bin/env python3
-"""Validate the PREP7 Qwen provider-interface candidate and fixtures."""
+"""Validate the focused Qwen implementation-interface candidate and fixtures."""
 
 from __future__ import annotations
 
 import json
+import math
 import re
 import sys
+from datetime import datetime
 from pathlib import Path
 from typing import Any
 
@@ -33,15 +35,20 @@ EXPECTED_ERRORS = (
 )
 EXPECTED_LIMITS = {
     "control_frame_bytes": 65536,
+    "control_json_depth": 16,
+    "control_json_nodes": 2048,
+    "control_key_utf8_bytes": 64,
     "request_id_bytes": 64,
     "job_id_bytes": 64,
     "text_utf8_bytes": 16384,
     "instruction_utf8_bytes": 4096,
     "voice_design_utf8_bytes": 4096,
+    "consent_purpose_utf8_bytes": 256,
     "prompt_duration_ms": 30000,
     "prompt_audio_bytes": 11520000,
     "audio_chunk_frames": 48000,
     "audio_chunk_bytes": 192000,
+    "audio_chunks_per_job": 65536,
     "descriptors_per_message": 1,
     "output_duration_ms": 900000,
     "deadline_ms": 3600000,
@@ -87,9 +94,26 @@ class CandidateError(ValueError):
         self.code = code
 
 
+def _reject_json_constant(value: str) -> None:
+    raise CandidateError("INVALID_REQUEST", f"non-standard JSON constant is forbidden: {value}")
+
+
+def _unique_json_object(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+    result: dict[str, Any] = {}
+    for key, value in pairs:
+        if key in result:
+            raise CandidateError("INVALID_REQUEST", f"duplicate JSON object key: {key}")
+        result[key] = value
+    return result
+
+
 def load_json(path: Path) -> Any:
     with path.open("r", encoding="utf-8") as handle:
-        return json.load(handle)
+        return json.load(
+            handle,
+            object_pairs_hook=_unique_json_object,
+            parse_constant=_reject_json_constant,
+        )
 
 
 def _require(condition: bool, code: str, message: str) -> None:
@@ -100,7 +124,7 @@ def _require(condition: bool, code: str, message: str) -> None:
 def validate_spec(spec: dict[str, Any]) -> None:
     _require(spec.get("schema") == "kilix.qwen-tts.provider/candidate-v1",
              "SPEC_SCHEMA", "candidate schema identity drifted")
-    _require(spec.get("status") == "PREP7_CANDIDATE_NOT_FROZEN",
+    _require(spec.get("status") == "QWEN_IMPLEMENTATION_CANDIDATE_NOT_FROZEN",
              "SPEC_STATUS", "candidate must not claim a freeze")
     _require(spec.get("protocol") == {"major": 1, "minor": 0},
              "SPEC_PROTOCOL", "candidate protocol identity drifted")
@@ -180,6 +204,71 @@ def _walk_keys(value: Any):
             yield from _walk_keys(child)
 
 
+def _validate_control_structure(spec: dict[str, Any], value: Any) -> None:
+    """Bound an already-decoded control value before recursive field inspection."""
+
+    limits = spec["limits"]
+    try:
+        encoded = json.dumps(
+            value, allow_nan=False, ensure_ascii=False, separators=(",", ":"),
+            sort_keys=True,
+        ).encode("utf-8")
+    except (TypeError, ValueError) as error:
+        raise CandidateError(
+            "INVALID_REQUEST", "control frame is not strict JSON",
+        ) from error
+    _require(len(encoded) <= limits["control_frame_bytes"], "LIMIT_EXCEEDED",
+             "control frame exceeds its byte bound")
+
+    nodes = 0
+    stack: list[tuple[Any, int]] = [(value, 1)]
+    while stack:
+        current, depth = stack.pop()
+        nodes += 1
+        _require(nodes <= limits["control_json_nodes"], "LIMIT_EXCEEDED",
+                 "control JSON node population exceeds its bound")
+        _require(depth <= limits["control_json_depth"], "LIMIT_EXCEEDED",
+                 "control JSON nesting exceeds its depth bound")
+        if isinstance(current, dict):
+            for key, child in current.items():
+                _require(isinstance(key, str), "INVALID_REQUEST",
+                         "control object keys must be strings")
+                _require(len(key.encode("utf-8")) <= limits["control_key_utf8_bytes"],
+                         "LIMIT_EXCEEDED", "control object key exceeds its byte bound")
+                stack.append((child, depth + 1))
+        elif isinstance(current, list):
+            stack.extend((child, depth + 1) for child in current)
+        elif isinstance(current, float):
+            _require(math.isfinite(current), "INVALID_REQUEST",
+                     "control frame contains a non-finite number")
+        else:
+            _require(current is None or isinstance(current, (str, int, bool)),
+                     "INVALID_REQUEST", "control frame contains a non-JSON value")
+
+
+def parse_control_frame(spec: dict[str, Any], payload: bytes) -> dict[str, Any]:
+    """Decode and validate one bounded UTF-8 JSON control frame."""
+
+    _require(type(payload) is bytes, "INVALID_REQUEST",
+             "control frame must be immutable bytes")
+    _require(0 < len(payload) <= spec["limits"]["control_frame_bytes"],
+             "LIMIT_EXCEEDED", "raw control frame is outside its byte bound")
+    try:
+        text = payload.decode("utf-8", errors="strict")
+    except UnicodeDecodeError as error:
+        raise CandidateError("INVALID_REQUEST", "control frame is not valid UTF-8") from error
+    try:
+        value = json.loads(
+            text,
+            object_pairs_hook=_unique_json_object,
+            parse_constant=_reject_json_constant,
+        )
+    except json.JSONDecodeError as error:
+        raise CandidateError("INVALID_REQUEST", "control frame is not valid JSON") from error
+    _require(isinstance(value, dict), "INVALID_REQUEST",
+             "control frame root must be an object")
+    validate_request(spec, value)
+    return value
 def _utf8_length(value: Any, field: str, maximum: int) -> str:
     _require(isinstance(value, str) and bool(value.strip()), "INVALID_REQUEST",
              f"{field} must be a non-empty string")
@@ -201,9 +290,11 @@ def _validate_output(spec: dict[str, Any], output: Any) -> None:
     audio = spec["audio"]
     _require(output.get("sample_format") in audio["sample_formats"],
              "INVALID_REQUEST", "unsupported output sample format")
-    _require(output.get("sample_rate_hz") in audio["sample_rates_hz"],
+    _require(type(output.get("sample_rate_hz")) is int
+             and output.get("sample_rate_hz") in audio["sample_rates_hz"],
              "INVALID_REQUEST", "unsupported output sample rate")
-    _require(output.get("channels") in audio["channels"],
+    _require(type(output.get("channels")) is int
+             and output.get("channels") in audio["channels"],
              "INVALID_REQUEST", "unsupported output channel count")
 
 
@@ -245,7 +336,8 @@ def _validate_prompt(spec: dict[str, Any], args: dict[str, Any]) -> None:
     _require(isinstance(consent, dict), "CONSENT_REQUIRED",
              "prompt cloning requires a consent record")
     _require(set(consent) == {
-        "schema", "source_sha256", "asserted_by_peer", "allowed_use", "recorded_at",
+        "schema", "source_sha256", "asserted_by_peer", "allowed_use", "purpose",
+        "recorded_at",
     }, "CONSENT_REQUIRED", "consent field population is invalid")
     _require(consent.get("schema") == "kilix.voice.consent/candidate-v1",
              "CONSENT_REQUIRED", "consent schema is incompatible")
@@ -253,15 +345,33 @@ def _validate_prompt(spec: dict[str, Any], args: dict[str, Any]) -> None:
              "CONSENT_REQUIRED", "consent is not bound to the prompt digest")
     _require(consent.get("asserted_by_peer") is True, "CONSENT_REQUIRED",
              "authenticated peer did not attest consent")
-    _require(consent.get("allowed_use") in {"this-project", "named-purpose"},
+    allowed_use = consent.get("allowed_use")
+    purpose = consent.get("purpose")
+    _require(allowed_use in {"this-project", "named-purpose"},
              "CONSENT_REQUIRED", "consent allowed_use is invalid")
+    if allowed_use == "this-project":
+        _require(purpose is None, "CONSENT_REQUIRED",
+                 "this-project consent forbids a named purpose")
+    else:
+        _require(isinstance(purpose, str) and bool(purpose.strip()),
+                 "CONSENT_REQUIRED", "named-purpose consent requires a purpose")
+        _require(len(purpose.encode("utf-8"))
+                 <= spec["limits"]["consent_purpose_utf8_bytes"],
+                 "CONSENT_REQUIRED", "consent purpose exceeds its UTF-8 byte limit")
     _require(isinstance(consent.get("recorded_at"), str)
              and UTC.fullmatch(consent["recorded_at"]) is not None,
              "CONSENT_REQUIRED", "consent timestamp is not canonical UTC")
+    try:
+        datetime.strptime(consent["recorded_at"], "%Y-%m-%dT%H:%M:%SZ")
+    except ValueError as error:
+        raise CandidateError(
+            "CONSENT_REQUIRED", "consent timestamp is not a real UTC time",
+        ) from error
 
 
 def validate_request(spec: dict[str, Any], request: Any) -> None:
     _require(isinstance(request, dict), "INVALID_REQUEST", "request is not an object")
+    _validate_control_structure(spec, request)
     forbidden = set(spec["forbidden_request_fields"])
     used_forbidden = sorted(forbidden.intersection(_walk_keys(request)))
     _require(not used_forbidden, "FORBIDDEN_FIELD",
@@ -376,7 +486,7 @@ def run() -> None:
              "valid fixtures cover fewer than 6/6 wire operations")
 
     for path in valid_paths:
-        validate_request(spec, load_json(path))
+        parse_control_frame(spec, path.read_bytes())
     for path in invalid_paths:
         record = load_json(path)
         try:

@@ -28,6 +28,7 @@
       "source_sha256": "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
       "asserted_by_peer": true,
       "allowed_use": "this-project",
+      "purpose": null,
       "recorded_at": "2026-08-29T00:00:00Z"
     },
     "output": {

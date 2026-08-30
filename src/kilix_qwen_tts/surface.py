@@ -12,7 +12,7 @@ import hashlib
 import json
 import re
 import struct
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from datetime import datetime
 from enum import Enum
 from typing import Any
@@ -32,14 +32,18 @@ PROVIDER_REFUSAL = (
 
 MAX_AUDIO_CHUNK_FRAMES = 48_000
 MAX_AUDIO_CHUNK_BYTES = 192_000
+MAX_AUDIO_CHUNKS = 65_536
 MAX_OUTPUT_DURATION_MS = 900_000
 MAX_PROMPT_DURATION_MS = 30_000
 MAX_PROMPT_AUDIO_BYTES = 11_520_000
 MAX_ID_BYTES = 256
+MAX_JOB_ID_BYTES = 64
+MAX_CONSENT_PURPOSE_BYTES = 256
 
 _SHA256 = re.compile(r"^[0-9a-f]{64}$")
 _UTC = re.compile(r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z$")
 _CONTROL_CHARACTERS = re.compile(r"[\x00-\x1f\x7f]")
+_PROMPT_BINDING_FACTORY = object()
 
 
 class SurfaceError(ValueError):
@@ -82,6 +86,13 @@ def _identity(value: object, code: str, name: str) -> str:
     return value
 
 
+def _bounded_identity(value: object, code: str, name: str, maximum: int) -> str:
+    text = _identity(value, code, name)
+    _require(len(text.encode("utf-8")) <= maximum, code,
+             f"{name} exceeds its byte bound")
+    return text
+
+
 @dataclass(frozen=True, slots=True)
 class AudioFormat:
     sample_format: str
@@ -112,37 +123,67 @@ class AudioFormat:
 @dataclass(frozen=True, slots=True)
 class AudioChunk:
     sequence: int
+    descriptor_count: int
+    descriptor_index: int
     frame_count: int
+    byte_length: int
+    sha256: str
     pcm: bytes
 
     def __post_init__(self) -> None:
         _nonnegative_int(self.sequence, "CHUNK_SEQUENCE", "chunk sequence")
+        _require(type(self.descriptor_count) is int and self.descriptor_count == 1,
+                 "DESCRIPTOR_MISMATCH",
+                 "chunk message must carry exactly 1/1 descriptor")
+        _require(type(self.descriptor_index) is int and self.descriptor_index == 0,
+                 "DESCRIPTOR_MISMATCH",
+                 "chunk descriptor index must be 0 in the 1/1 allowed population")
         frames = _positive_int(self.frame_count, "CHUNK_FRAMES", "chunk frame_count")
         _require(frames <= MAX_AUDIO_CHUNK_FRAMES, "CHUNK_FRAMES",
                  "chunk frame population exceeds the candidate bound")
+        size = _positive_int(self.byte_length, "CHUNK_BYTES", "chunk byte_length")
+        _require(size <= MAX_AUDIO_CHUNK_BYTES, "CHUNK_BYTES",
+                 "chunk byte_length exceeds the candidate bound")
         _require(type(self.pcm) is bytes and bool(self.pcm), "CHUNK_BYTES",
                  "chunk PCM must be non-empty immutable bytes")
         _require(len(self.pcm) <= MAX_AUDIO_CHUNK_BYTES, "CHUNK_BYTES",
                  "chunk PCM exceeds the candidate byte bound")
+        _require(size == len(self.pcm), "DESCRIPTOR_MISMATCH",
+                 "chunk byte_length disagrees with descriptor bytes")
+        _require(isinstance(self.sha256, str) and _SHA256.fullmatch(self.sha256) is not None,
+                 "DESCRIPTOR_MISMATCH", "chunk SHA-256 is not canonical")
+        _require(hashlib.sha256(self.pcm).hexdigest() == self.sha256,
+                 "DESCRIPTOR_MISMATCH", "chunk SHA-256 disagrees with descriptor bytes")
 
 
 @dataclass(frozen=True, slots=True)
 class SynthesisResult:
+    job_id: str
     engine_id: str
     model_id: str
+    model_revision: str
     seed: int
     audio_format: AudioFormat
     chunks: tuple[AudioChunk, ...]
+    prompt_binding: PromptBinding | None = None
 
     def __post_init__(self) -> None:
+        object.__setattr__(self, "job_id", _bounded_identity(
+            self.job_id, "JOB_ID", "job_id", MAX_JOB_ID_BYTES,
+        ))
         object.__setattr__(self, "engine_id", _identity(self.engine_id, "ENGINE_ID", "engine_id"))
         object.__setattr__(self, "model_id", _identity(self.model_id, "MODEL_ID", "model_id"))
+        object.__setattr__(self, "model_revision", _identity(
+            self.model_revision, "MODEL_REVISION", "model_revision",
+        ))
         seed = _nonnegative_int(self.seed, "SEED", "seed")
         _require(seed < 2**63, "SEED", "seed exceeds the candidate bound")
         _require(isinstance(self.audio_format, AudioFormat), "AUDIO_FORMAT",
                  "audio_format must be an AudioFormat")
         _require(isinstance(self.chunks, tuple) and bool(self.chunks),
                  "EMPTY_AUDIO", "a final synthesis result requires at least 1/1 chunk")
+        _require(len(self.chunks) <= MAX_AUDIO_CHUNKS, "CHUNK_COUNT",
+                 "result chunk population exceeds the candidate bound")
         for expected, chunk in enumerate(self.chunks):
             _require(isinstance(chunk, AudioChunk), "CHUNK_TYPE",
                      "every result chunk must be an AudioChunk")
@@ -153,6 +194,15 @@ class SynthesisResult:
         _require(self.frame_count * 1000
                  <= MAX_OUTPUT_DURATION_MS * self.audio_format.sample_rate_hz,
                  "OUTPUT_DURATION", "result exceeds the candidate duration bound")
+        if self.prompt_binding is not None:
+            _require(isinstance(self.prompt_binding, PromptBinding), "CONSENT_REQUIRED",
+                     "prompt_binding must be a validated PromptBinding")
+            _require(self.prompt_binding.job_id == self.job_id,
+                     "CONSENT_REQUIRED", "prompt binding job identity drifted")
+            _require(self.prompt_binding.model_id == self.model_id,
+                     "CONSENT_REQUIRED", "prompt binding model identity drifted")
+            _require(self.prompt_binding.model_revision == self.model_revision,
+                     "CONSENT_REQUIRED", "prompt binding model revision drifted")
 
     @property
     def frame_count(self) -> int:
@@ -163,8 +213,15 @@ class SynthesisResult:
         return b"".join(chunk.pcm for chunk in self.chunks)
 
     @property
+    def byte_length(self) -> int:
+        return sum(chunk.byte_length for chunk in self.chunks)
+
+    @property
     def pcm_sha256(self) -> str:
-        return hashlib.sha256(self.pcm_bytes).hexdigest()
+        digest = hashlib.sha256()
+        for chunk in self.chunks:
+            digest.update(chunk.pcm)
+        return digest.hexdigest()
 
 
 class AudioStreamAssembler:
@@ -190,37 +247,39 @@ class AudioStreamAssembler:
     def chunk_count(self) -> int:
         return len(self._chunks)
 
-    def append(self, sequence: int, pcm: bytes) -> AudioChunk:
+    def append(self, chunk: AudioChunk) -> AudioChunk:
         _require(not self._sealed, "STREAM_SEALED", "audio stream is already sealed")
-        _nonnegative_int(sequence, "CHUNK_SEQUENCE", "chunk sequence")
-        _require(sequence == len(self._chunks), "CHUNK_SEQUENCE",
+        _require(isinstance(chunk, AudioChunk), "CHUNK_TYPE",
+                 "stream input must be a validated AudioChunk")
+        _require(len(self._chunks) < MAX_AUDIO_CHUNKS, "CHUNK_COUNT",
+                 "stream chunk population exceeds the candidate bound")
+        _require(chunk.sequence == len(self._chunks), "CHUNK_SEQUENCE",
                  "chunk sequence must be contiguous from zero")
-        _require(type(pcm) is bytes and bool(pcm), "CHUNK_BYTES",
-                 "chunk PCM must be non-empty immutable bytes")
-        _require(len(pcm) <= MAX_AUDIO_CHUNK_BYTES, "CHUNK_BYTES",
-                 "chunk PCM exceeds the candidate byte bound")
-        _require(len(pcm) % self._format.bytes_per_frame == 0,
+        _require(len(chunk.pcm) % self._format.bytes_per_frame == 0,
                  "CHUNK_ALIGNMENT", "chunk PCM is not frame aligned")
-        frames = len(pcm) // self._format.bytes_per_frame
-        _require(0 < frames <= MAX_AUDIO_CHUNK_FRAMES, "CHUNK_FRAMES",
-                 "chunk frame population exceeds the candidate bound")
-        new_frames = self._frames + frames
+        _require(len(chunk.pcm) == chunk.frame_count * self._format.bytes_per_frame,
+                 "DESCRIPTOR_MISMATCH", "chunk frame_count disagrees with descriptor bytes")
+        new_frames = self._frames + chunk.frame_count
         _require(new_frames * 1000 <= self._max_duration_ms * self._format.sample_rate_hz,
                  "OUTPUT_DURATION", "stream exceeds the requested duration bound")
-        chunk = AudioChunk(sequence, frames, pcm)
         self._chunks.append(chunk)
         self._frames = new_frames
         return chunk
 
-    def finish(self, *, engine_id: str, model_id: str, seed: int) -> SynthesisResult:
+    def finish(self, *, job_id: str, engine_id: str, model_id: str,
+               model_revision: str, seed: int,
+               prompt_binding: PromptBinding | None = None) -> SynthesisResult:
         _require(not self._sealed, "STREAM_SEALED", "audio stream is already sealed")
         _require(bool(self._chunks), "EMPTY_AUDIO", "cannot finish an empty audio stream")
         result = SynthesisResult(
+            job_id=job_id,
             engine_id=engine_id,
             model_id=model_id,
+            model_revision=model_revision,
             seed=seed,
             audio_format=self._format,
             chunks=tuple(self._chunks),
+            prompt_binding=prompt_binding,
         )
         self._sealed = True
         return result
@@ -294,6 +353,7 @@ class ConsentBinding:
     source_sha256: str
     asserted_by_peer: bool
     allowed_use: str
+    purpose: str | None
     recorded_at: str
 
     def __post_init__(self) -> None:
@@ -306,6 +366,14 @@ class ConsentBinding:
                  "authenticated peer did not attest consent")
         _require(self.allowed_use in {"this-project", "named-purpose"},
                  "CONSENT_REQUIRED", "consent allowed_use is invalid")
+        if self.allowed_use == "this-project":
+            _require(self.purpose is None, "CONSENT_REQUIRED",
+                     "this-project consent forbids a named purpose")
+        else:
+            object.__setattr__(self, "purpose", _bounded_identity(
+                self.purpose, "CONSENT_REQUIRED", "consent purpose",
+                MAX_CONSENT_PURPOSE_BYTES,
+            ))
         _require(isinstance(self.recorded_at, str) and _UTC.fullmatch(self.recorded_at) is not None,
                  "CONSENT_REQUIRED", "consent timestamp is not canonical UTC")
         try:
@@ -313,15 +381,107 @@ class ConsentBinding:
         except ValueError as error:
             raise SurfaceError("CONSENT_REQUIRED", "consent timestamp is not a real UTC time") from error
 
+    @property
+    def sha256(self) -> str:
+        payload = {
+            "allowed_use": self.allowed_use,
+            "asserted_by_peer": self.asserted_by_peer,
+            "purpose": self.purpose,
+            "recorded_at": self.recorded_at,
+            "schema": self.schema,
+            "source_sha256": self.source_sha256,
+        }
+        encoded = json.dumps(payload, separators=(",", ":"), sort_keys=True).encode("utf-8")
+        return hashlib.sha256(encoded).hexdigest()
 
-def bind_prompt(prompt: PromptAudio, consent: ConsentBinding) -> str:
+
+@dataclass(frozen=True, slots=True, init=False)
+class PromptBinding:
+    prompt_sha256: str
+    consent_sha256: str
+    peer_uid: int
+    model_id: str
+    model_revision: str
+    job_id: str
+    allowed_use: str
+    purpose: str | None
+
+    def __init__(self, prompt_sha256: str, consent_sha256: str, peer_uid: int,
+                 model_id: str, model_revision: str, job_id: str, allowed_use: str,
+                 purpose: str | None, *, _factory: object | None = None) -> None:
+        _require(_factory is _PROMPT_BINDING_FACTORY, "CONSENT_REQUIRED",
+                 "prompt bindings may only be created from verified descriptor bytes")
+        object.__setattr__(self, "prompt_sha256", prompt_sha256)
+        object.__setattr__(self, "consent_sha256", consent_sha256)
+        object.__setattr__(self, "peer_uid", peer_uid)
+        object.__setattr__(self, "model_id", model_id)
+        object.__setattr__(self, "model_revision", model_revision)
+        object.__setattr__(self, "job_id", job_id)
+        object.__setattr__(self, "allowed_use", allowed_use)
+        object.__setattr__(self, "purpose", purpose)
+        self.__post_init__()
+
+    def __post_init__(self) -> None:
+        _require(isinstance(self.prompt_sha256, str)
+                 and _SHA256.fullmatch(self.prompt_sha256) is not None,
+                 "CONSENT_REQUIRED", "bound prompt SHA-256 is not canonical")
+        _require(isinstance(self.consent_sha256, str)
+                 and _SHA256.fullmatch(self.consent_sha256) is not None,
+                 "CONSENT_REQUIRED", "bound consent SHA-256 is not canonical")
+        _nonnegative_int(self.peer_uid, "UNAUTHORIZED_PEER", "peer_uid")
+        _require(self.peer_uid <= 0xFFFFFFFF, "UNAUTHORIZED_PEER",
+                 "peer_uid exceeds the SO_PEERCRED uid_t bound")
+        object.__setattr__(self, "model_id", _identity(
+            self.model_id, "MODEL_ID", "model_id",
+        ))
+        object.__setattr__(self, "model_revision", _identity(
+            self.model_revision, "MODEL_REVISION", "model_revision",
+        ))
+        object.__setattr__(self, "job_id", _bounded_identity(
+            self.job_id, "JOB_ID", "job_id", MAX_JOB_ID_BYTES,
+        ))
+        _require(self.allowed_use in {"this-project", "named-purpose"},
+                 "CONSENT_REQUIRED", "bound allowed_use is invalid")
+        if self.allowed_use == "this-project":
+            _require(self.purpose is None, "CONSENT_REQUIRED",
+                     "this-project binding forbids a named purpose")
+        else:
+            object.__setattr__(self, "purpose", _bounded_identity(
+                self.purpose, "CONSENT_REQUIRED", "bound consent purpose",
+                MAX_CONSENT_PURPOSE_BYTES,
+            ))
+
+
+def bind_prompt(prompt: PromptAudio, consent: ConsentBinding, pcm: bytes, *,
+                descriptor_count: int, peer_uid: int, model_id: str,
+                model_revision: str,
+                job_id: str) -> PromptBinding:
     _require(isinstance(prompt, PromptAudio), "PROMPT_TYPE",
              "prompt must be PromptAudio")
     _require(isinstance(consent, ConsentBinding), "CONSENT_REQUIRED",
              "consent must be ConsentBinding")
+    _require(type(descriptor_count) is int and descriptor_count == 1,
+             "DESCRIPTOR_MISMATCH",
+             "prompt message must carry exactly 1/1 descriptor")
+    _require(type(pcm) is bytes and bool(pcm), "PROMPT_BYTES",
+             "prompt PCM must be non-empty immutable bytes")
+    _require(len(pcm) == prompt.byte_length, "DESCRIPTOR_MISMATCH",
+             "prompt byte_length disagrees with descriptor bytes")
+    _require(hashlib.sha256(pcm).hexdigest() == prompt.sha256,
+             "DESCRIPTOR_MISMATCH", "prompt SHA-256 disagrees with descriptor bytes")
     _require(prompt.sha256 == consent.source_sha256, "CONSENT_REQUIRED",
              "consent is not bound to the prompt digest")
-    return prompt.sha256
+    return PromptBinding(
+        prompt_sha256=prompt.sha256,
+        consent_sha256=consent.sha256,
+        peer_uid=peer_uid,
+        model_id=model_id,
+        model_revision=model_revision,
+        job_id=job_id,
+        allowed_use=consent.allowed_use,
+        purpose=consent.purpose,
+        _factory=_PROMPT_BINDING_FACTORY,
+    )
 
 
 class JobState(str, Enum):
@@ -334,29 +494,43 @@ class JobState(str, Enum):
     FAILED = "failed"
 
 
-@dataclass(slots=True)
 class JobLifecycle:
-    state: JobState = JobState.QUEUED
-    result: SynthesisResult | None = field(default=None, init=False)
-    failure_code: str | None = field(default=None, init=False)
+    __slots__ = ("_failure_code", "_result", "_state")
+
+    def __init__(self) -> None:
+        self._state = JobState.QUEUED
+        self._result: SynthesisResult | None = None
+        self._failure_code: str | None = None
+
+    @property
+    def state(self) -> JobState:
+        return self._state
+
+    @property
+    def result(self) -> SynthesisResult | None:
+        return self._result
+
+    @property
+    def failure_code(self) -> str | None:
+        return self._failure_code
 
     def start_loading(self) -> JobState:
         _require(self.state is JobState.QUEUED, "JOB_TRANSITION",
                  "only a queued job can start loading")
-        self.state = JobState.LOADING
+        self._state = JobState.LOADING
         return self.state
 
     def start_streaming(self) -> JobState:
         _require(self.state is JobState.LOADING, "JOB_TRANSITION",
                  "only a loading job can start streaming")
-        self.state = JobState.STREAMING
+        self._state = JobState.STREAMING
         return self.state
 
     def request_cancel(self) -> JobState:
         if self.state is JobState.QUEUED:
-            self.state = JobState.CANCELED
+            self._state = JobState.CANCELED
         elif self.state in {JobState.LOADING, JobState.STREAMING}:
-            self.state = JobState.CANCEL_REQUESTED
+            self._state = JobState.CANCEL_REQUESTED
         elif self.state not in {JobState.CANCEL_REQUESTED, JobState.CANCELED}:
             raise SurfaceError("JOB_TERMINAL", "a terminal job cannot be canceled")
         return self.state
@@ -364,7 +538,7 @@ class JobLifecycle:
     def acknowledge_cancel(self) -> JobState:
         _require(self.state is JobState.CANCEL_REQUESTED, "JOB_TRANSITION",
                  "only a cancel-requested job can acknowledge cancellation")
-        self.state = JobState.CANCELED
+        self._state = JobState.CANCELED
         return self.state
 
     def complete(self, result: SynthesisResult) -> JobState:
@@ -372,8 +546,8 @@ class JobLifecycle:
                  "only a streaming job can complete")
         _require(isinstance(result, SynthesisResult), "RESULT_TYPE",
                  "completion requires a final SynthesisResult")
-        self.result = result
-        self.state = JobState.SUCCEEDED
+        self._result = result
+        self._state = JobState.SUCCEEDED
         return self.state
 
     def fail(self, code: str) -> JobState:
@@ -381,9 +555,9 @@ class JobLifecycle:
             JobState.QUEUED, JobState.LOADING, JobState.STREAMING,
             JobState.CANCEL_REQUESTED,
         }, "JOB_TERMINAL", "a terminal job cannot fail again")
-        self.failure_code = _identity(code, "FAILURE_CODE", "failure code")
-        self.result = None
-        self.state = JobState.FAILED
+        self._failure_code = _identity(code, "FAILURE_CODE", "failure code")
+        self._result = None
+        self._state = JobState.FAILED
         return self.state
 
 
@@ -420,18 +594,27 @@ def inspect_command(command: str) -> dict[str, Any]:
 def result_metadata(result: SynthesisResult) -> str:
     """Return deterministic metadata without transcript, prompt, or audio content."""
 
-    payload = {
+    _require(isinstance(result, SynthesisResult), "RESULT_TYPE",
+             "result must be a final SynthesisResult")
+    payload: dict[str, Any] = {
         "audio": {
             "channels": result.audio_format.channels,
             "frame_count": result.frame_count,
-            "pcm_bytes": len(result.pcm_bytes),
+            "pcm_bytes": result.byte_length,
             "pcm_sha256": result.pcm_sha256,
             "sample_format": result.audio_format.sample_format,
             "sample_rate_hz": result.audio_format.sample_rate_hz,
         },
         "engine": {"id": result.engine_id},
-        "model": {"id": result.model_id},
+        "job_id": result.job_id,
+        "model": {"id": result.model_id, "revision": result.model_revision},
         "schema": SURFACE_SCHEMA,
         "seed": result.seed,
     }
+    if result.prompt_binding is not None:
+        payload["conditioning"] = {
+            "allowed_use": result.prompt_binding.allowed_use,
+            "consent_sha256": result.prompt_binding.consent_sha256,
+            "prompt_sha256": result.prompt_binding.prompt_sha256,
+        }
     return json.dumps(payload, separators=(",", ":"), sort_keys=True) + "\n"

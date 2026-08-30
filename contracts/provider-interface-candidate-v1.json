@@ -1,6 +1,6 @@
 {
   "schema": "kilix.qwen-tts.provider/candidate-v1",
-  "status": "PREP7_CANDIDATE_NOT_FROZEN",
+  "status": "QWEN_IMPLEMENTATION_CANDIDATE_NOT_FROZEN",
   "protocol": {
     "major": 1,
     "minor": 0
@@ -90,15 +90,20 @@
   },
   "limits": {
     "control_frame_bytes": 65536,
+    "control_json_depth": 16,
+    "control_json_nodes": 2048,
+    "control_key_utf8_bytes": 64,
     "request_id_bytes": 64,
     "job_id_bytes": 64,
     "text_utf8_bytes": 16384,
     "instruction_utf8_bytes": 4096,
     "voice_design_utf8_bytes": 4096,
+    "consent_purpose_utf8_bytes": 256,
     "prompt_duration_ms": 30000,
     "prompt_audio_bytes": 11520000,
     "audio_chunk_frames": 48000,
     "audio_chunk_bytes": 192000,
+    "audio_chunks_per_job": 65536,
     "descriptors_per_message": 1,
     "output_duration_ms": 900000,
     "deadline_ms": 3600000,

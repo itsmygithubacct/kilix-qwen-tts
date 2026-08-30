@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import copy
 import importlib.util
+import math
 import unittest
 from pathlib import Path
 
@@ -45,6 +46,22 @@ class InterfaceCandidateTests(unittest.TestCase):
         request["args"]["consent"]["source_sha256"] = "f" * 64
         self.refusal(request, "CONSENT_REQUIRED")
 
+    def test_named_purpose_must_be_explicit(self) -> None:
+        request = copy.deepcopy(self.clone)
+        request["args"]["consent"]["allowed_use"] = "named-purpose"
+        request["args"]["consent"]["purpose"] = None
+        self.refusal(request, "CONSENT_REQUIRED")
+
+    def test_this_project_forbids_named_purpose(self) -> None:
+        request = copy.deepcopy(self.clone)
+        request["args"]["consent"]["purpose"] = "another-purpose"
+        self.refusal(request, "CONSENT_REQUIRED")
+
+    def test_impossible_consent_timestamp_is_refused(self) -> None:
+        request = copy.deepcopy(self.clone)
+        request["args"]["consent"]["recorded_at"] = "2026-02-30T00:00:00Z"
+        self.refusal(request, "CONSENT_REQUIRED")
+
     def test_prompt_limit_is_enforced(self) -> None:
         with self.subTest("duration"):
             request = copy.deepcopy(self.clone)
@@ -60,10 +77,66 @@ class InterfaceCandidateTests(unittest.TestCase):
         request["args"]["output"]["channels"] = 2
         self.refusal(request, "INVALID_REQUEST")
 
+    def test_boolean_output_numbers_are_refused(self) -> None:
+        request = copy.deepcopy(self.named)
+        request["args"]["output"]["channels"] = True
+        self.refusal(request, "INVALID_REQUEST")
+
     def test_shell_field_is_refused_recursively(self) -> None:
         request = copy.deepcopy(self.named)
         request["extensions"] = {"x_nested": {"command": "run"}}
         self.refusal(request, "FORBIDDEN_FIELD")
+
+    def test_control_nesting_is_bounded(self) -> None:
+        request = copy.deepcopy(self.named)
+        nested = True
+        for _ in range(self.spec["limits"]["control_json_depth"]):
+            nested = [nested]
+        request["extensions"] = {"x_nested": nested}
+        self.refusal(request, "LIMIT_EXCEEDED")
+
+    def test_control_node_population_is_bounded(self) -> None:
+        request = copy.deepcopy(self.named)
+        request["extensions"] = {
+            "x_nodes": [None] * self.spec["limits"]["control_json_nodes"]
+        }
+        self.refusal(request, "LIMIT_EXCEEDED")
+
+    def test_control_key_length_is_bounded(self) -> None:
+        request = copy.deepcopy(self.named)
+        request["extensions"] = {
+            "x_" + "a" * self.spec["limits"]["control_key_utf8_bytes"]: True
+        }
+        self.refusal(request, "LIMIT_EXCEEDED")
+
+    def test_control_frame_size_is_bounded(self) -> None:
+        request = copy.deepcopy(self.named)
+        request["extensions"] = {
+            "x_padding": "a" * self.spec["limits"]["control_frame_bytes"]
+        }
+        self.refusal(request, "LIMIT_EXCEEDED")
+
+    def test_raw_control_frame_size_is_bounded_before_decode(self) -> None:
+        payload = b" " * (self.spec["limits"]["control_frame_bytes"] + 1)
+        with self.assertRaises(interface.CandidateError) as caught:
+            interface.parse_control_frame(self.spec, payload)
+        self.assertEqual(caught.exception.code, "LIMIT_EXCEEDED")
+
+    def test_duplicate_control_key_is_refused(self) -> None:
+        payload = b'{"schema":"first","schema":"second"}'
+        with self.assertRaises(interface.CandidateError) as caught:
+            interface.parse_control_frame(self.spec, payload)
+        self.assertEqual(caught.exception.code, "INVALID_REQUEST")
+
+    def test_invalid_control_utf8_is_refused(self) -> None:
+        with self.assertRaises(interface.CandidateError) as caught:
+            interface.parse_control_frame(self.spec, b"\xff")
+        self.assertEqual(caught.exception.code, "INVALID_REQUEST")
+
+    def test_non_finite_extension_number_is_refused(self) -> None:
+        request = copy.deepcopy(self.named)
+        request["extensions"] = {"x_number": math.inf}
+        self.refusal(request, "INVALID_REQUEST")
 
     def test_compatible_extension_shape(self) -> None:
         request = copy.deepcopy(self.named)

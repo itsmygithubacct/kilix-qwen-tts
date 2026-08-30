@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import struct
 import sys
@@ -12,6 +13,7 @@ from kilix_qwen_tts.surface import (
     CLI_COMMANDS,
     MAX_AUDIO_CHUNK_BYTES,
     MAX_AUDIO_CHUNK_FRAMES,
+    MAX_AUDIO_CHUNKS,
     MAX_OUTPUT_DURATION_MS,
     PROVIDER_REFUSAL,
     RUNTIME_COMMANDS,
@@ -50,14 +52,32 @@ def expect_refusal(action, code: str) -> None:
         raise SurfaceError("MUTATION_ACCEPTED", f"expected {code} refusal")
 
 
+def synthetic_chunk(sequence: int, pcm: bytes, audio_format: AudioFormat) -> AudioChunk:
+    return AudioChunk(
+        sequence=sequence,
+        descriptor_count=1,
+        descriptor_index=0,
+        frame_count=len(pcm) // audio_format.bytes_per_frame,
+        byte_length=len(pcm),
+        sha256=hashlib.sha256(pcm).hexdigest(),
+        pcm=pcm,
+    )
+
+
 def synthetic_result(sample_format: str = "s16le"):
     audio_format = AudioFormat(sample_format, 24_000, 1)
     assembler = AudioStreamAssembler(audio_format, 1_000)
-    assembler.append(0, b"\x00" * (240 * audio_format.bytes_per_frame))
-    assembler.append(1, b"\x01" * (240 * audio_format.bytes_per_frame))
+    assembler.append(synthetic_chunk(
+        0, b"\x00" * (240 * audio_format.bytes_per_frame), audio_format,
+    ))
+    assembler.append(synthetic_chunk(
+        1, b"\x01" * (240 * audio_format.bytes_per_frame), audio_format,
+    ))
     return assembler.finish(
+        job_id="job-synthetic",
         engine_id="synthetic-engine-not-selected",
         model_id="synthetic-model-not-selected",
+        model_revision="synthetic-revision-not-selected",
         seed=7,
     )
 
@@ -74,6 +94,7 @@ def run() -> None:
             "RUNTIME_COMMANDS", "runtime refusal population differs from 4/4")
     require(MAX_AUDIO_CHUNK_BYTES == spec["limits"]["audio_chunk_bytes"]
             and MAX_AUDIO_CHUNK_FRAMES == spec["limits"]["audio_chunk_frames"]
+            and MAX_AUDIO_CHUNKS == spec["limits"]["audio_chunks_per_job"]
             and MAX_OUTPUT_DURATION_MS == spec["limits"]["output_duration_ms"],
             "LIMITS", "implementation limits differ from the interface candidate")
 
@@ -115,17 +136,44 @@ def run() -> None:
     require(json.loads(result_metadata(s16))["audio"]["pcm_sha256"] == s16.pcm_sha256,
             "RESULT_METADATA", "result metadata digest drifted")
 
-    digest = "01" * 32
-    prompt = PromptAudio(0, AudioFormat("s16le", 24_000, 1), 1_000, 24_000, 48_000, digest)
+    prompt_pcm = b"\x01\x02" * 24_000
+    digest = hashlib.sha256(prompt_pcm).hexdigest()
+    prompt = PromptAudio(
+        0, AudioFormat("s16le", 24_000, 1), 1_000, 24_000, 48_000, digest,
+    )
     consent = ConsentBinding(
         "kilix.voice.consent/candidate-v1",
         digest,
         True,
         "this-project",
+        None,
         "2026-08-29T00:00:00Z",
     )
-    require(bind_prompt(prompt, consent) == digest, "CONSENT_BINDING",
-            "prompt consent digest did not bind")
+    binding = bind_prompt(
+        prompt, consent, prompt_pcm,
+        descriptor_count=1,
+        peer_uid=1000,
+        model_id="synthetic-model-not-selected",
+        model_revision="synthetic-revision-not-selected",
+        job_id="job-clone",
+    )
+    require(binding.prompt_sha256 == digest and binding.peer_uid == 1000,
+            "CONSENT_BINDING", "prompt bytes, peer, and consent did not bind")
+
+    clone_format = AudioFormat("s16le", 24_000, 1)
+    clone = AudioStreamAssembler(clone_format, 1_000)
+    clone.append(synthetic_chunk(0, b"\x00\x00", clone_format))
+    clone_result = clone.finish(
+        job_id="job-clone",
+        engine_id="synthetic-engine-not-selected",
+        model_id="synthetic-model-not-selected",
+        model_revision="synthetic-revision-not-selected",
+        seed=7,
+        prompt_binding=binding,
+    )
+    clone_metadata = json.loads(result_metadata(clone_result))
+    require(clone_metadata["conditioning"]["consent_sha256"] == binding.consent_sha256,
+            "CONSENT_PROVENANCE", "result provenance lost the consent binding")
 
     success = JobLifecycle()
     require(success.start_loading() is JobState.LOADING, "LIFECYCLE", "load did not start")
@@ -148,35 +196,59 @@ def run() -> None:
 
     aligned = AudioStreamAssembler(AudioFormat("f32le", 24_000, 1), 1_000)
     gap = AudioStreamAssembler(AudioFormat("s16le", 24_000, 1), 1_000)
-    frame_limit = AudioStreamAssembler(AudioFormat("s16le", 24_000, 1), 10_000)
+    s16_format = AudioFormat("s16le", 24_000, 1)
     duration = AudioStreamAssembler(AudioFormat("s16le", 24_000, 1), 1)
-    duration.append(0, b"\x00" * 48)
+    duration.append(synthetic_chunk(0, b"\x00" * 48, s16_format))
     empty = AudioStreamAssembler(AudioFormat("s16le", 24_000, 1), 1_000)
     canceled = JobLifecycle()
     canceled.request_cancel()
     sealed = AudioStreamAssembler(AudioFormat("s16le", 24_000, 1), 1_000)
-    sealed.append(0, b"\x00\x00")
-    sealed.finish(engine_id="e", model_id="m", seed=0)
+    sealed.append(synthetic_chunk(0, b"\x00\x00", s16_format))
+    sealed.finish(job_id="j", engine_id="e", model_id="m", model_revision="r", seed=0)
+    bad_digest_pcm = b"\x00\x00"
     out_of_order = (
-        AudioChunk(0, 1, b"\x00\x00"),
-        AudioChunk(2, 1, b"\x00\x00"),
+        synthetic_chunk(0, b"\x00\x00", s16_format),
+        synthetic_chunk(2, b"\x00\x00", s16_format),
     )
     controls = (
         (lambda: AudioFormat("u8", 24_000, 1), "AUDIO_FORMAT"),
-        (lambda: aligned.append(0, b"\x00"), "CHUNK_ALIGNMENT"),
-        (lambda: gap.append(1, b"\x00\x00"), "CHUNK_SEQUENCE"),
-        (lambda: frame_limit.append(0, b"\x00" * (48_001 * 2)), "CHUNK_FRAMES"),
-        (lambda: duration.append(1, b"\x00\x00"), "OUTPUT_DURATION"),
+        (lambda: aligned.append(AudioChunk(
+            0, 1, 0, 1, 1, hashlib.sha256(b"\x00").hexdigest(), b"\x00",
+        )), "CHUNK_ALIGNMENT"),
+        (lambda: gap.append(synthetic_chunk(1, b"\x00\x00", s16_format)),
+         "CHUNK_SEQUENCE"),
+        (lambda: AudioChunk(
+            0, 1, 0, 48_001, 96_002,
+            hashlib.sha256(b"\x00" * 96_002).hexdigest(), b"\x00" * 96_002,
+        ), "CHUNK_FRAMES"),
+        (lambda: duration.append(synthetic_chunk(1, b"\x00\x00", s16_format)),
+         "OUTPUT_DURATION"),
         (lambda: bind_prompt(prompt, ConsentBinding(
             "kilix.voice.consent/candidate-v1", "02" * 32, True,
-            "this-project", "2026-08-29T00:00:00Z",
-        )), "CONSENT_REQUIRED"),
-        (lambda: empty.finish(engine_id="e", model_id="m", seed=0), "EMPTY_AUDIO"),
+            "this-project", None, "2026-08-29T00:00:00Z",
+        ), prompt_pcm, descriptor_count=1, peer_uid=1000,
+            model_id="m",
+            model_revision="r", job_id="j"), "CONSENT_REQUIRED"),
+        (lambda: bind_prompt(
+            prompt, consent, b"\x00" * len(prompt_pcm), descriptor_count=1,
+            peer_uid=1000, model_id="m", model_revision="r", job_id="j",
+        ), "DESCRIPTOR_MISMATCH"),
+        (lambda: AudioChunk(
+            0, 1, 0, 1, len(bad_digest_pcm), "00" * 32, bad_digest_pcm,
+        ), "DESCRIPTOR_MISMATCH"),
+        (lambda: empty.finish(
+            job_id="j", engine_id="e", model_id="m", model_revision="r", seed=0,
+        ), "EMPTY_AUDIO"),
         (lambda: canceled.complete(s16), "JOB_TRANSITION"),
-        (lambda: sealed.append(1, b"\x00\x00"), "STREAM_SEALED"),
+        (lambda: sealed.append(synthetic_chunk(1, b"\x00\x00", s16_format)),
+         "STREAM_SEALED"),
         (lambda: SynthesisResult(
-            "e", "m", 0, AudioFormat("s16le", 24_000, 1), out_of_order,
+            "j", "e", "m", "r", 0, s16_format, out_of_order,
         ), "CHUNK_SEQUENCE"),
+        (lambda: SynthesisResult(
+            "job-clone", "e", "other-model", "synthetic-revision-not-selected",
+            0, s16_format, (synthetic_chunk(0, b"\x00\x00", s16_format),), binding,
+        ), "CONSENT_REQUIRED"),
     )
     for action, expected_code in controls:
         expect_refusal(action, expected_code)
@@ -185,8 +257,8 @@ def run() -> None:
         "QWEN_IMPLEMENTATION_SURFACE: PASS "
         "(6/6 commands; 2/2 introspection commands; 4/4 runtime commands refused; "
         "4/4 audio format/rate combinations; 2/2 deterministic WAV encodings; "
-        "1/1 consent-bound prompt; 7/7 lifecycle terminals/transitions; "
-        "10/10 negative controls; 0/2 Qwen model lines selected; "
+        "1/1 byte/peer/model/result-bound prompt; 7/7 lifecycle terminals/transitions; "
+        "13/13 negative controls; 0/2 Qwen model lines selected; "
         "0/2 release tier slots selected; 0/3 synthesis modes selected)"
     )
 
