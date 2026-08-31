@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import copy
 import importlib.util
+import json
 import math
 import unittest
 from pathlib import Path
@@ -95,6 +96,14 @@ class InterfaceCandidateTests(unittest.TestCase):
         request["extensions"] = {"x_nested": nested}
         self.refusal(request, "LIMIT_EXCEEDED")
 
+    def test_extreme_direct_control_nesting_is_stably_refused(self) -> None:
+        request = copy.deepcopy(self.named)
+        nested = True
+        for _ in range(10_000):
+            nested = [nested]
+        request["extensions"] = {"x_nested": nested}
+        self.refusal(request, "LIMIT_EXCEEDED")
+
     def test_control_node_population_is_bounded(self) -> None:
         request = copy.deepcopy(self.named)
         request["extensions"] = {
@@ -122,6 +131,33 @@ class InterfaceCandidateTests(unittest.TestCase):
             interface.parse_control_frame(self.spec, payload)
         self.assertEqual(caught.exception.code, "LIMIT_EXCEEDED")
 
+    def test_extreme_raw_control_nesting_is_stably_refused(self) -> None:
+        request = copy.deepcopy(self.named)
+        request["extensions"] = {"x_nested": "QWEN1_NESTING_MARKER"}
+        payload = json.dumps(request, separators=(",", ":")).encode("utf-8")
+        nested = b"[" * 10_000 + b"true" + b"]" * 10_000
+        payload = payload.replace(b'"QWEN1_NESTING_MARKER"', nested, 1)
+        self.assertLessEqual(len(payload), self.spec["limits"]["control_frame_bytes"])
+        with self.assertRaises(interface.CandidateError) as caught:
+            interface.parse_control_frame(self.spec, payload)
+        self.assertEqual(caught.exception.code, "LIMIT_EXCEEDED")
+
+    def test_extreme_raw_integer_is_stably_refused(self) -> None:
+        request = copy.deepcopy(self.named)
+        request["extensions"] = {"x_integer": "QWEN1_INTEGER_MARKER"}
+        payload = json.dumps(request, separators=(",", ":")).encode("utf-8")
+        integer = b"9" * 50_000
+        payload = payload.replace(b'"QWEN1_INTEGER_MARKER"', integer, 1)
+        self.assertLessEqual(len(payload), self.spec["limits"]["control_frame_bytes"])
+        with self.assertRaises(interface.CandidateError) as caught:
+            interface.parse_control_frame(self.spec, payload)
+        self.assertEqual(caught.exception.code, "LIMIT_EXCEEDED")
+
+    def test_extreme_direct_integer_is_stably_refused(self) -> None:
+        request = copy.deepcopy(self.named)
+        request["extensions"] = {"x_integer": 10 ** 50_000}
+        self.refusal(request, "LIMIT_EXCEEDED")
+
     def test_duplicate_control_key_is_refused(self) -> None:
         payload = b'{"schema":"first","schema":"second"}'
         with self.assertRaises(interface.CandidateError) as caught:
@@ -131,6 +167,15 @@ class InterfaceCandidateTests(unittest.TestCase):
     def test_invalid_control_utf8_is_refused(self) -> None:
         with self.assertRaises(interface.CandidateError) as caught:
             interface.parse_control_frame(self.spec, b"\xff")
+        self.assertEqual(caught.exception.code, "INVALID_REQUEST")
+
+    def test_lone_surrogate_escape_is_stably_refused(self) -> None:
+        request = copy.deepcopy(self.named)
+        request["extensions"] = {"x_text": "QWEN1_SURROGATE_MARKER"}
+        payload = json.dumps(request, separators=(",", ":")).encode("utf-8")
+        payload = payload.replace(b'"QWEN1_SURROGATE_MARKER"', b'"\\ud800"', 1)
+        with self.assertRaises(interface.CandidateError) as caught:
+            interface.parse_control_frame(self.spec, payload)
         self.assertEqual(caught.exception.code, "INVALID_REQUEST")
 
     def test_non_finite_extension_number_is_refused(self) -> None:
@@ -169,6 +214,13 @@ class InterfaceCandidateTests(unittest.TestCase):
         request = copy.deepcopy(self.hello)
         request["args"]["protocol_major"] = 2
         self.refusal(request, "INCOMPATIBLE_PROTOCOL")
+
+    def test_protocol_major_requires_exact_integer(self) -> None:
+        for malformed in (True, 1.0):
+            with self.subTest(malformed=malformed):
+                request = copy.deepcopy(self.hello)
+                request["args"]["protocol_major"] = malformed
+                self.refusal(request, "INCOMPATIBLE_PROTOCOL")
 
 
 if __name__ == "__main__":

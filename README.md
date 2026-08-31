@@ -43,7 +43,9 @@ gate-independent mechanics:
 The request validator also bounds 1/1 control frame by byte size, nesting
 depth, node population, and key size before recursively inspecting forbidden
 fields. Oversized raw frames, invalid UTF-8, duplicate object keys, non-finite
-JSON numbers, and impossible UTC consent dates are refused.
+JSON numbers, oversized numeric tokens, recursion-limit nesting, lone-surrogate
+escapes, and impossible UTC consent dates are refused with stable candidate
+errors.
 
 All 4/4 runtime-bearing commands fail closed with exit status 69 and the exact
 provider refusal:
@@ -60,7 +62,7 @@ make check
 
 That command validates all 6/6 operation request shapes, 19/19 declared error
 codes, 8/8 valid fixtures, 6/6 refusal fixtures, 13/13 implementation mutation
-controls, and 69/69 unit tests using only Python's standard library.
+controls, and 75/75 unit tests using only Python's standard library.
 
 ## Boundary
 

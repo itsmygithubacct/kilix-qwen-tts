@@ -90,9 +90,11 @@
   },
   "limits": {
     "control_frame_bytes": 65536,
+    "control_integer_bits": 213,
     "control_json_depth": 16,
     "control_json_nodes": 2048,
     "control_key_utf8_bytes": 64,
+    "control_number_token_bytes": 64,
     "request_id_bytes": 64,
     "job_id_bytes": 64,
     "text_utf8_bytes": 16384,

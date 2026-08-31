@@ -35,9 +35,11 @@ EXPECTED_ERRORS = (
 )
 EXPECTED_LIMITS = {
     "control_frame_bytes": 65536,
+    "control_integer_bits": 213,
     "control_json_depth": 16,
     "control_json_nodes": 2048,
     "control_key_utf8_bytes": 64,
+    "control_number_token_bytes": 64,
     "request_id_bytes": 64,
     "job_id_bytes": 64,
     "text_utf8_bytes": 16384,
@@ -95,14 +97,14 @@ class CandidateError(ValueError):
 
 
 def _reject_json_constant(value: str) -> None:
-    raise CandidateError("INVALID_REQUEST", f"non-standard JSON constant is forbidden: {value}")
+    raise CandidateError("INVALID_REQUEST", "non-standard JSON constants are forbidden")
 
 
 def _unique_json_object(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
     result: dict[str, Any] = {}
     for key, value in pairs:
         if key in result:
-            raise CandidateError("INVALID_REQUEST", f"duplicate JSON object key: {key}")
+            raise CandidateError("INVALID_REQUEST", "duplicate JSON object keys are forbidden")
         result[key] = value
     return result
 
@@ -204,23 +206,21 @@ def _walk_keys(value: Any):
             yield from _walk_keys(child)
 
 
+def _strict_utf8_size(value: str) -> int:
+    try:
+        return len(value.encode("utf-8"))
+    except UnicodeEncodeError as error:
+        raise CandidateError(
+            "INVALID_REQUEST", "control strings must contain Unicode scalar text",
+        ) from error
+
+
 def _validate_control_structure(spec: dict[str, Any], value: Any) -> None:
     """Bound an already-decoded control value before recursive field inspection."""
 
     limits = spec["limits"]
-    try:
-        encoded = json.dumps(
-            value, allow_nan=False, ensure_ascii=False, separators=(",", ":"),
-            sort_keys=True,
-        ).encode("utf-8")
-    except (TypeError, ValueError) as error:
-        raise CandidateError(
-            "INVALID_REQUEST", "control frame is not strict JSON",
-        ) from error
-    _require(len(encoded) <= limits["control_frame_bytes"], "LIMIT_EXCEEDED",
-             "control frame exceeds its byte bound")
-
     nodes = 0
+    scalar_bytes = 0
     stack: list[tuple[Any, int]] = [(value, 1)]
     while stack:
         current, depth = stack.pop()
@@ -230,20 +230,101 @@ def _validate_control_structure(spec: dict[str, Any], value: Any) -> None:
         _require(depth <= limits["control_json_depth"], "LIMIT_EXCEEDED",
                  "control JSON nesting exceeds its depth bound")
         if isinstance(current, dict):
+            _require(nodes + len(stack) + len(current) <= limits["control_json_nodes"],
+                     "LIMIT_EXCEEDED", "control JSON node population exceeds its bound")
             for key, child in current.items():
                 _require(isinstance(key, str), "INVALID_REQUEST",
                          "control object keys must be strings")
-                _require(len(key.encode("utf-8")) <= limits["control_key_utf8_bytes"],
+                _require(len(key) <= limits["control_key_utf8_bytes"],
                          "LIMIT_EXCEEDED", "control object key exceeds its byte bound")
+                key_bytes = _strict_utf8_size(key)
+                _require(key_bytes <= limits["control_key_utf8_bytes"],
+                         "LIMIT_EXCEEDED", "control object key exceeds its byte bound")
+                scalar_bytes += key_bytes
                 stack.append((child, depth + 1))
         elif isinstance(current, list):
+            _require(nodes + len(stack) + len(current) <= limits["control_json_nodes"],
+                     "LIMIT_EXCEEDED", "control JSON node population exceeds its bound")
             stack.extend((child, depth + 1) for child in current)
         elif isinstance(current, float):
             _require(math.isfinite(current), "INVALID_REQUEST",
                      "control frame contains a non-finite number")
+            scalar_bytes += len(repr(current))
+        elif type(current) is int:
+            _require(current.bit_length() <= limits["control_integer_bits"],
+                     "LIMIT_EXCEEDED", "control integer exceeds its bit bound")
+            token_bytes = len(str(current).encode("ascii"))
+            _require(token_bytes <= limits["control_number_token_bytes"],
+                     "LIMIT_EXCEEDED", "control integer token exceeds its byte bound")
+            scalar_bytes += token_bytes
+        elif isinstance(current, str):
+            _require(len(current) <= limits["control_frame_bytes"], "LIMIT_EXCEEDED",
+                     "control string exceeds the frame bound")
+            scalar_bytes += _strict_utf8_size(current)
         else:
-            _require(current is None or isinstance(current, (str, int, bool)),
+            _require(current is None or isinstance(current, bool),
                      "INVALID_REQUEST", "control frame contains a non-JSON value")
+            scalar_bytes += 4
+        _require(scalar_bytes <= limits["control_frame_bytes"], "LIMIT_EXCEEDED",
+                 "control scalar population exceeds the frame bound")
+
+    try:
+        encoded = json.dumps(
+            value, allow_nan=False, ensure_ascii=False, separators=(",", ":"),
+            sort_keys=True,
+        ).encode("utf-8")
+    except (RecursionError, TypeError, ValueError) as error:
+        raise CandidateError(
+            "INVALID_REQUEST", "control frame is not strict JSON",
+        ) from error
+    _require(len(encoded) <= limits["control_frame_bytes"], "LIMIT_EXCEEDED",
+             "control frame exceeds its byte bound")
+
+
+def _validate_raw_json_nesting(text: str, maximum: int) -> None:
+    """Reject excessive container depth without invoking a recursive decoder."""
+
+    depth = 0
+    in_string = False
+    escaped = False
+    for character in text:
+        if in_string:
+            if escaped:
+                escaped = False
+            elif character == "\\":
+                escaped = True
+            elif character == '"':
+                in_string = False
+            continue
+        if character == '"':
+            in_string = True
+        elif character in "[{":
+            depth += 1
+            _require(depth <= maximum, "LIMIT_EXCEEDED",
+                     "raw control JSON nesting exceeds its depth bound")
+        elif character in "]}":
+            depth -= 1
+            _require(depth >= 0, "INVALID_REQUEST",
+                     "raw control JSON containers are unbalanced")
+
+
+def _bounded_json_int(spec: dict[str, Any], token: str) -> int:
+    limits = spec["limits"]
+    _require(len(token.encode("ascii")) <= limits["control_number_token_bytes"],
+             "LIMIT_EXCEEDED", "control integer token exceeds its byte bound")
+    value = int(token)
+    _require(value.bit_length() <= limits["control_integer_bits"],
+             "LIMIT_EXCEEDED", "control integer exceeds its bit bound")
+    return value
+
+
+def _bounded_json_float(spec: dict[str, Any], token: str) -> float:
+    _require(len(token.encode("ascii")) <= spec["limits"]["control_number_token_bytes"],
+             "LIMIT_EXCEEDED", "control number token exceeds its byte bound")
+    value = float(token)
+    _require(math.isfinite(value), "INVALID_REQUEST",
+             "control frame contains a non-finite number")
+    return value
 
 
 def parse_control_frame(spec: dict[str, Any], payload: bytes) -> dict[str, Any]:
@@ -257,18 +338,25 @@ def parse_control_frame(spec: dict[str, Any], payload: bytes) -> dict[str, Any]:
         text = payload.decode("utf-8", errors="strict")
     except UnicodeDecodeError as error:
         raise CandidateError("INVALID_REQUEST", "control frame is not valid UTF-8") from error
+    _validate_raw_json_nesting(text, spec["limits"]["control_json_depth"])
     try:
         value = json.loads(
             text,
             object_pairs_hook=_unique_json_object,
             parse_constant=_reject_json_constant,
+            parse_float=lambda token: _bounded_json_float(spec, token),
+            parse_int=lambda token: _bounded_json_int(spec, token),
         )
-    except json.JSONDecodeError as error:
+    except CandidateError:
+        raise
+    except (json.JSONDecodeError, RecursionError, ValueError) as error:
         raise CandidateError("INVALID_REQUEST", "control frame is not valid JSON") from error
     _require(isinstance(value, dict), "INVALID_REQUEST",
              "control frame root must be an object")
     validate_request(spec, value)
     return value
+
+
 def _utf8_length(value: Any, field: str, maximum: int) -> str:
     _require(isinstance(value, str) and bool(value.strip()), "INVALID_REQUEST",
              f"{field} must be a non-empty string")
@@ -413,7 +501,8 @@ def validate_request(spec: dict[str, Any], request: Any) -> None:
         _require(set(args) == HELLO_FIELDS, "INVALID_REQUEST",
                  "hello argument population is invalid")
         protocol = spec["protocol"]
-        _require(args.get("protocol_major") == protocol["major"],
+        major = args.get("protocol_major")
+        _require(type(major) is int and major == protocol["major"],
                  "INCOMPATIBLE_PROTOCOL", "protocol major is incompatible")
         minor = args.get("protocol_minor")
         _require(isinstance(minor, int) and not isinstance(minor, bool)
