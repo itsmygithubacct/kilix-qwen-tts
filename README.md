@@ -62,7 +62,7 @@ make check
 
 That command validates all 6/6 operation request shapes, 19/19 declared error
 codes, 8/8 valid fixtures, 6/6 refusal fixtures, 13/13 implementation mutation
-controls, and 75/75 unit tests using only Python's standard library.
+controls, and 78/78 unit tests using only Python's standard library.
 
 ## Boundary
 
