@@ -376,7 +376,8 @@ def _validate_output(spec: dict[str, Any], output: Any) -> None:
     _require(set(output) == {"sample_format", "sample_rate_hz", "channels"},
              "INVALID_REQUEST", "output field population is invalid")
     audio = spec["audio"]
-    _require(output.get("sample_format") in audio["sample_formats"],
+    _require(isinstance(output.get("sample_format"), str)
+             and output.get("sample_format") in audio["sample_formats"],
              "INVALID_REQUEST", "unsupported output sample format")
     _require(type(output.get("sample_rate_hz")) is int
              and output.get("sample_rate_hz") in audio["sample_rates_hz"],
@@ -476,7 +477,8 @@ def validate_request(spec: dict[str, Any], request: Any) -> None:
              "message type must be request")
     _token(request.get("request_id"), "request_id")
     op = request.get("op")
-    _require(op in EXPECTED_WIRE, "UNKNOWN_OPERATION", "wire operation is unknown")
+    _require(isinstance(op, str) and op in EXPECTED_WIRE,
+             "UNKNOWN_OPERATION", "wire operation is unknown")
     deadline = request.get("deadline_ms")
     _require(isinstance(deadline, int) and not isinstance(deadline, bool)
              and 0 < deadline <= spec["limits"]["deadline_ms"],

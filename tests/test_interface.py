@@ -217,12 +217,22 @@ class InterfaceCandidateTests(unittest.TestCase):
         request["args"]["temperature"] = 0.7
         self.refusal(request, "INVALID_REQUEST")
 
-    def test_unhashable_synthesis_mode_is_stably_refused(self) -> None:
-        for malformed in ([], {}):
-            with self.subTest(malformed=malformed):
-                request = copy.deepcopy(self.named)
-                request["args"]["mode"] = malformed
-                self.refusal(request, "UNSUPPORTED_CAPABILITY")
+    def test_unhashable_request_enums_are_stably_refused(self) -> None:
+        for field, code in (
+            ("op", "UNKNOWN_OPERATION"),
+            ("mode", "UNSUPPORTED_CAPABILITY"),
+            ("sample_format", "INVALID_REQUEST"),
+        ):
+            for malformed in ([], {}):
+                with self.subTest(field=field, malformed=malformed):
+                    request = copy.deepcopy(self.named)
+                    if field == "op":
+                        request["op"] = malformed
+                    elif field == "mode":
+                        request["args"]["mode"] = malformed
+                    else:
+                        request["args"]["output"]["sample_format"] = malformed
+                    self.refusal(request, code)
 
     def test_incompatible_hello_major_is_refused(self) -> None:
         request = copy.deepcopy(self.hello)

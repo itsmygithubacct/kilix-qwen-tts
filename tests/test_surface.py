@@ -74,7 +74,12 @@ class AudioFormatTests(unittest.TestCase):
         self.assertEqual(len(formats), 4)
 
     def test_unknown_sample_format_is_refused(self) -> None:
-        self.refusal(lambda: AudioFormat("u8", 24_000, 1), "AUDIO_FORMAT")
+        for malformed in ("u8", [], {}):
+            with self.subTest(malformed=malformed):
+                self.refusal(
+                    lambda: AudioFormat(malformed, 24_000, 1),  # type: ignore[arg-type]
+                    "AUDIO_FORMAT",
+                )
 
     def test_boolean_sample_rate_is_refused(self) -> None:
         self.refusal(lambda: AudioFormat("s16le", True, 1), "AUDIO_RATE")
@@ -443,6 +448,11 @@ class CommandTests(unittest.TestCase):
                 code, stdout, stderr = self.invoke(command)
                 self.assertEqual((code, stdout), (69, ""))
                 self.assertEqual(stderr, PROVIDER_REFUSAL + "\n")
+        for malformed in ([], {}):
+            with self.subTest(malformed=malformed):
+                with self.assertRaises(SurfaceError) as caught:
+                    surface.inspect_command(malformed)  # type: ignore[arg-type]
+                self.assertEqual(caught.exception.code, "COMMAND")
 
 
 if __name__ == "__main__":

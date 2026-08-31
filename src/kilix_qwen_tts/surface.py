@@ -100,7 +100,8 @@ class AudioFormat:
     channels: int
 
     def __post_init__(self) -> None:
-        _require(self.sample_format in SAMPLE_FORMATS, "AUDIO_FORMAT",
+        _require(type(self.sample_format) is str
+                 and self.sample_format in SAMPLE_FORMATS, "AUDIO_FORMAT",
                  "sample format is outside the 2/2 candidate population")
         _require(type(self.sample_rate_hz) is int and self.sample_rate_hz in SAMPLE_RATES_HZ,
                  "AUDIO_RATE", "sample rate is outside the 2/2 candidate population")
@@ -584,7 +585,7 @@ def models_payload() -> dict[str, Any]:
 
 
 def inspect_command(command: str) -> dict[str, Any]:
-    _require(command in CLI_COMMANDS, "COMMAND",
+    _require(type(command) is str and command in CLI_COMMANDS, "COMMAND",
              "command is outside the 6/6 candidate population")
     if command == "models":
         return models_payload()
