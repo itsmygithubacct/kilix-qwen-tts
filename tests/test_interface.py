@@ -53,6 +53,13 @@ class InterfaceCandidateTests(unittest.TestCase):
         request["args"]["consent"]["purpose"] = None
         self.refusal(request, "CONSENT_REQUIRED")
 
+    def test_unhashable_consent_use_is_stably_refused(self) -> None:
+        for malformed in ([], {}):
+            with self.subTest(malformed=malformed):
+                request = copy.deepcopy(self.clone)
+                request["args"]["consent"]["allowed_use"] = malformed
+                self.refusal(request, "CONSENT_REQUIRED")
+
     def test_this_project_forbids_named_purpose(self) -> None:
         request = copy.deepcopy(self.clone)
         request["args"]["consent"]["purpose"] = "another-purpose"
@@ -209,6 +216,13 @@ class InterfaceCandidateTests(unittest.TestCase):
         request = copy.deepcopy(self.named)
         request["args"]["temperature"] = 0.7
         self.refusal(request, "INVALID_REQUEST")
+
+    def test_unhashable_synthesis_mode_is_stably_refused(self) -> None:
+        for malformed in ([], {}):
+            with self.subTest(malformed=malformed):
+                request = copy.deepcopy(self.named)
+                request["args"]["mode"] = malformed
+                self.refusal(request, "UNSUPPORTED_CAPABILITY")
 
     def test_incompatible_hello_major_is_refused(self) -> None:
         request = copy.deepcopy(self.hello)

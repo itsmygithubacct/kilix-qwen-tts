@@ -279,6 +279,13 @@ class ConsentTests(unittest.TestCase):
             self.consent(asserted=False)
         self.assertEqual(caught.exception.code, "CONSENT_REQUIRED")
 
+    def test_unhashable_consent_use_is_stably_refused(self) -> None:
+        for malformed in ([], {}):
+            with self.subTest(malformed=malformed):
+                with self.assertRaises(SurfaceError) as caught:
+                    self.consent(allowed_use=malformed)  # type: ignore[arg-type]
+                self.assertEqual(caught.exception.code, "CONSENT_REQUIRED")
+
     def test_impossible_timestamp_is_refused(self) -> None:
         with self.assertRaises(SurfaceError) as caught:
             self.consent(recorded_at="2026-02-30T00:00:00Z")

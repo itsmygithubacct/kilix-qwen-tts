@@ -435,7 +435,8 @@ def _validate_prompt(spec: dict[str, Any], args: dict[str, Any]) -> None:
              "authenticated peer did not attest consent")
     allowed_use = consent.get("allowed_use")
     purpose = consent.get("purpose")
-    _require(allowed_use in {"this-project", "named-purpose"},
+    _require(isinstance(allowed_use, str)
+             and allowed_use in {"this-project", "named-purpose"},
              "CONSENT_REQUIRED", "consent allowed_use is invalid")
     if allowed_use == "this-project":
         _require(purpose is None, "CONSENT_REQUIRED",
@@ -545,7 +546,8 @@ def validate_request(spec: dict[str, Any], request: Any) -> None:
     _validate_output(spec, args.get("output"))
 
     mode = args.get("mode")
-    _require(mode in EXPECTED_MODES, "UNSUPPORTED_CAPABILITY",
+    _require(isinstance(mode, str) and mode in EXPECTED_MODES,
+             "UNSUPPORTED_CAPABILITY",
              "synthesis mode is unknown")
     allowed_mode_fields = SUBMIT_COMMON_FIELDS | MODE_FIELDS[mode]
     _require(set(args).issubset(allowed_mode_fields),

@@ -364,7 +364,8 @@ class ConsentBinding:
                  "CONSENT_REQUIRED", "consent source digest is not canonical")
         _require(self.asserted_by_peer is True, "CONSENT_REQUIRED",
                  "authenticated peer did not attest consent")
-        _require(self.allowed_use in {"this-project", "named-purpose"},
+        _require(isinstance(self.allowed_use, str)
+                 and self.allowed_use in {"this-project", "named-purpose"},
                  "CONSENT_REQUIRED", "consent allowed_use is invalid")
         if self.allowed_use == "this-project":
             _require(self.purpose is None, "CONSENT_REQUIRED",
@@ -440,7 +441,8 @@ class PromptBinding:
         object.__setattr__(self, "job_id", _bounded_identity(
             self.job_id, "JOB_ID", "job_id", MAX_JOB_ID_BYTES,
         ))
-        _require(self.allowed_use in {"this-project", "named-purpose"},
+        _require(isinstance(self.allowed_use, str)
+                 and self.allowed_use in {"this-project", "named-purpose"},
                  "CONSENT_REQUIRED", "bound allowed_use is invalid")
         if self.allowed_use == "this-project":
             _require(self.purpose is None, "CONSENT_REQUIRED",
