@@ -252,6 +252,11 @@ class RuntimeTests(unittest.TestCase):
             result, audio = run_job(self.runtime, source.fileno(), arguments,
                                    deadline=time.monotonic() + 5, cancel=threading.Event())
         validate_result(result, arguments, audio)
+        for key, value in (('sample_rate_hz', 48000), ('sample_format', 'f32le'), ('channels', 2)):
+            changed = copy.deepcopy(arguments)
+            changed['output'][key] = value
+            with self.subTest(output=key), self.assertRaises(ProtocolError):
+                validate_result(result, changed, audio)
         for key, value in (('model_id', []), ('model_revision', 'different'), ('seed', True),
                            ('seed', 8), ('duration_ms', 101), ('conditioning', {}), ('engine_id', 'other')):
             candidate = copy.deepcopy(result)
@@ -267,6 +272,12 @@ class RuntimeTests(unittest.TestCase):
             result['audio']['sha256'] = hashlib.sha256(invalid).hexdigest()
             with self.subTest(riff_size=size), self.assertRaises(ProtocolError):
                 validate_result(result, arguments, invalid)
+        for offset, encoding, value in ((28, '<I', 1), (32, '<H', 65535)):
+            invalid = bytearray(audio)
+            struct.pack_into(encoding, invalid, offset, value)
+            result['audio']['sha256'] = hashlib.sha256(invalid).hexdigest()
+            with self.subTest(header_offset=offset), self.assertRaises(ProtocolError):
+                validate_result(result, arguments, bytes(invalid))
 
     def test_client_binds_terminal_kind_to_operation(self):
         arguments = self.arguments()

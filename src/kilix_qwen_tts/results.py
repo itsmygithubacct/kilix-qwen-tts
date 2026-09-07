@@ -2,10 +2,8 @@
 from __future__ import annotations
 
 import hashlib
-import io
 import json
 import struct
-import wave
 
 from .protocol import ProtocolError
 
@@ -20,6 +18,7 @@ def validate_result(result: dict, arguments: dict, payload: bytes) -> None:
     model_id = result['model_id']
     candidate = MODEL_CANDIDATES.get(model_id) if type(model_id) is str else None
     if (candidate is None or result['model_revision'] != candidate[0] or arguments['mode'] != candidate[1]
+            or arguments['output'] != {'sample_format': 's16le', 'sample_rate_hz': 24000, 'channels': 1}
             or arguments['model_id'] not in {'auto', model_id}
             or result['engine_id'] != 'qwen3-tts' or result['engine_revision'] != ENGINE_COMMIT
             or type(result['seed']) is not int or result['seed'] != arguments['seed']
@@ -40,16 +39,13 @@ def validate_result(result: dict, arguments: dict, payload: bytes) -> None:
 
 
 def validate_wave(payload: bytes, duration_ms: int) -> None:
-    try:
-        if (len(payload) < 44 or payload[:4] != b'RIFF' or payload[8:12] != b'WAVE'
-                or struct.unpack_from('<I', payload, 4)[0] != len(payload) - 8):
-            raise ValueError('invalid RIFF container size')
-        with wave.open(io.BytesIO(payload), 'rb') as audio:
-            if (audio.getnchannels(), audio.getframerate(), audio.getsampwidth(), audio.getcomptype()) != (1, 24000, 2, 'NONE'):
-                raise ValueError('invalid audio format')
-            if audio.getnframes() != duration_ms * 24 or len(payload) != 44 + audio.getnframes() * 2:
-                raise ValueError('invalid canonical audio size or duration')
-            if len(audio.readframes(audio.getnframes())) != audio.getnframes() * 2:
-                raise ValueError('truncated audio')
-    except (EOFError, ValueError, wave.Error) as error:
-        raise ProtocolError('INVALID_RESPONSE', 'invalid canonical WAV result') from error
+    if type(duration_ms) is not int or not 0 < duration_ms <= 900_000:
+        raise ProtocolError('INVALID_RESPONSE', 'invalid canonical audio duration')
+    size = duration_ms * 24 * 2
+    # The provider emits one canonical PCM16 header. Comparing every field
+    # also binds byte rate, block alignment, fmt size and the data chunk;
+    # Python's general WAV reader deliberately ignores some of those fields.
+    header = struct.pack('<4sI4s4sIHHIIHH4sI', b'RIFF', size + 36, b'WAVE',
+                         b'fmt ', 16, 1, 1, 24000, 48000, 2, 16, b'data', size)
+    if len(payload) != size + 44 or payload[:44] != header:
+        raise ProtocolError('INVALID_RESPONSE', 'invalid canonical WAV result')
