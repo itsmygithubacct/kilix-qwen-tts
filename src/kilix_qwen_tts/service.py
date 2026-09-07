@@ -1,0 +1,314 @@
+"""Private seqpacket service for supervised, one-at-a-time synthesis."""
+
+from __future__ import annotations
+
+import fcntl
+import hashlib
+import os
+from pathlib import Path
+import select
+import socket
+import stat
+import tempfile
+import threading
+import time
+import uuid
+
+from .protocol import (
+    PROTOCOL_SCHEMA, ProtocolError, ProviderRequest, receive_packet,
+    require_same_uid_peer, send_packet, verify_request_descriptors,
+)
+from .runtime import InstalledRuntime, MAX_INPUT_BYTES, private_directory, run_job
+
+SOCKET_NAME = "kilix-qwen-tts.sock"
+
+
+def runtime_directory() -> Path:
+    value = os.environ.get("XDG_RUNTIME_DIR")
+    if not value:
+        raise ProtocolError("INVALID_RUNTIME", "XDG_RUNTIME_DIR is required")
+    return private_directory(Path(value))
+
+
+def _closed(channel: socket.socket) -> bool:
+    try:
+        if not select.select([channel], [], [], 0)[0]:
+            return False
+        # Requests are single-packet operations: extra data is not another job.
+        channel.recv(1, socket.MSG_PEEK | socket.MSG_DONTWAIT)
+        return True
+    except BlockingIOError:
+        return False
+    except OSError:
+        return True
+
+
+def _reply(request: ProviderRequest, kind: str, result: dict) -> dict:
+    return {"schema": PROTOCOL_SCHEMA, "type": kind,
+            "request_id": request.request_id, "job_id": request.job_id,
+            "result": result}
+
+
+class Service:
+    def __init__(self, runtime: InstalledRuntime, directory: Path):
+        self.runtime = runtime
+        self.directory = private_directory(directory)
+        self.path = directory / SOCKET_NAME
+        self.stopping = threading.Event()
+        self.ready = threading.Event()
+        self._mutex = threading.Lock()
+        self._jobs: dict[str, threading.Event] = {}
+        self._slots = threading.BoundedSemaphore(8)
+        self._threads: list[threading.Thread] = []
+
+    def stop(self) -> None:
+        self.stopping.set()
+        with self._mutex:
+            for cancellation in self._jobs.values():
+                cancellation.set()
+
+    def serve(self) -> None:
+        if len(os.fsencode(self.path)) >= 108:
+            raise ProtocolError("INVALID_RUNTIME", "socket path is too long")
+        lock_fd = os.open(str(self.path) + ".lock", os.O_CREAT | os.O_RDWR | os.O_CLOEXEC | os.O_NOFOLLOW, 0o600)
+        listener = socket.socket(socket.AF_UNIX, socket.SOCK_SEQPACKET)
+        bound = None
+        try:
+            info = os.fstat(lock_fd)
+            if not stat.S_ISREG(info.st_mode) or info.st_uid != os.geteuid() or info.st_mode & 0o077:
+                raise ProtocolError("INVALID_RUNTIME", "unsafe service lock")
+            try:
+                fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError as error:
+                raise ProtocolError("BUSY", "provider is already running") from error
+            try:
+                old = self.path.lstat()
+            except FileNotFoundError:
+                old = None
+            if old is not None:
+                if not stat.S_ISSOCK(old.st_mode) or old.st_uid != os.geteuid():
+                    raise ProtocolError("INVALID_RUNTIME", "refusing existing non-socket path")
+                # Do not replace a live endpoint created by another service.
+                probe = socket.socket(socket.AF_UNIX, socket.SOCK_SEQPACKET)
+                try:
+                    probe.settimeout(0.1)
+                    probe.connect(str(self.path))
+                except ConnectionRefusedError:
+                    self.path.unlink()
+                else:
+                    raise ProtocolError("BUSY", "provider endpoint is live")
+                finally:
+                    probe.close()
+            listener.bind(str(self.path))
+            os.chmod(self.path, 0o600)
+            current = self.path.lstat()
+            bound = current.st_dev, current.st_ino
+            listener.listen(8)
+            listener.settimeout(0.2)
+            self.ready.set()
+            while not self.stopping.is_set():
+                try:
+                    channel, _ = listener.accept()
+                except TimeoutError:
+                    continue
+                if not self._slots.acquire(blocking=False):
+                    channel.close()
+                    continue
+                self._threads = [thread for thread in self._threads if thread.is_alive()]
+                thread = threading.Thread(target=self._handle, args=(channel,), daemon=True)
+                self._threads.append(thread)
+                thread.start()
+        finally:
+            self.stop()
+            listener.close()
+            for thread in self._threads:
+                thread.join()
+            if bound is not None:
+                try:
+                    current = self.path.lstat()
+                    if (current.st_dev, current.st_ino) == bound:
+                        self.path.unlink()
+                except FileNotFoundError:
+                    pass
+            os.close(lock_fd)
+
+    def _handle(self, channel: socket.socket) -> None:
+        request = None
+        descriptors = ()
+        snapshot = None
+        claimed = False
+        started = time.monotonic()
+        try:
+            channel.settimeout(2)
+            require_same_uid_peer(channel)
+            value, descriptors = receive_packet(channel)
+            request = ProviderRequest.from_payload(value)
+            deadline = started + request.deadline_ms / 1000
+            if request.operation == "submit":
+                if request.arguments.get("prompt_audio", {}).get("byte_length", 0) > MAX_INPUT_BYTES:
+                    raise ProtocolError("LIMIT_EXCEEDED", "input exceeds runtime bound")
+                language = request.arguments["language"].lower().split("-")[0]
+                if language not in {"en", "zh", "ja", "ko", "de", "fr", "ru", "pt", "es", "it", "auto"}:
+                    raise ProtocolError("UNSUPPORTED_CAPABILITY", "language is not supported by this runtime")
+                if request.arguments["mode"] == "prompt_clone" and "instruction" in request.arguments:
+                    raise ProtocolError("UNSUPPORTED_CAPABILITY", "clone runtime cannot apply instructions")
+                if self.runtime.model_id == "qwen3-tts-0.6b-customvoice" and request.arguments.get("instruction"):
+                    raise ProtocolError("UNSUPPORTED_CAPABILITY", "this named-voice model cannot apply instructions")
+                with self._mutex:
+                    if self._jobs or self.stopping.is_set():
+                        raise ProtocolError("BUSY", "speech worker is busy")
+                    cancellation = threading.Event()
+                    self._jobs[request.job_id] = cancellation
+                    claimed = True
+            snapshot = verify_request_descriptors(request, descriptors)
+            for descriptor in descriptors:
+                os.close(descriptor)
+            descriptors = ()
+            if request.operation == "hello":
+                result = {"protocol_major": 1, "protocol_minor": 0}
+                kind = "hello"
+            elif request.operation == "models":
+                result = {"models": [self.runtime.model_record()]}
+                kind = "models"
+            elif request.operation == "status":
+                with self._mutex:
+                    busy = bool(self._jobs)
+                result = {"provider_state": "busy" if busy else "ready", "worker_active": busy,
+                          "engine_id": "qwen3-tts", "model_id": self.runtime.model_id,
+                          "release_qualified": False}
+                kind = "status"
+            elif request.operation == "cancel":
+                with self._mutex:
+                    cancellation = self._jobs.get(request.job_id)
+                    if cancellation is not None:
+                        cancellation.set()
+                # This acknowledges a request; terminal CANCELED is emitted on
+                # the original job only after its worker has been reaped.
+                result = {"cancel_requested": cancellation is not None}
+                kind = "canceled"
+            elif request.operation == "unload":
+                with self._mutex:
+                    if self._jobs:
+                        raise ProtocolError("BUSY", "cannot unload during a job")
+                result = {"loaded": False}
+                kind = "unloaded"
+            else:
+                channel.settimeout(max(0.001, deadline - time.monotonic()))
+                send_packet(channel, _reply(request, "accepted", {}))
+                result, payload = run_job(self.runtime, snapshot, request.arguments,
+                                 deadline=deadline, cancel=cancellation,
+                                 disconnected=lambda: self.stopping.is_set() or _closed(channel))
+                # Canonical audio is returned in one read-only descriptor.
+                with tempfile.TemporaryFile() as writer:
+                    writer.write(payload)
+                    writer.flush()
+                    result_fd = os.open(f"/proc/self/fd/{writer.fileno()}", os.O_RDONLY | os.O_CLOEXEC)
+                    try:
+                        metadata = result
+                        send_packet(channel, _reply(request, "result", metadata), result_fd)
+                    finally:
+                        os.close(result_fd)
+                return
+            send_packet(channel, _reply(request, kind, result))
+        except (ProtocolError, OSError, ValueError, KeyError) as error:
+            if request is not None:
+                code = error.code if isinstance(error, ProtocolError) else "PROVIDER_ERROR"
+                event = _reply(request, "error", {})
+                event.pop("result")
+                event["error"] = {"code": code}
+                try:
+                    channel.settimeout(0.2)
+                    send_packet(channel, event)
+                except (ProtocolError, OSError):
+                    pass
+        finally:
+            if snapshot is not None:
+                os.close(snapshot)
+            for descriptor in descriptors:
+                os.close(descriptor)
+            if claimed:
+                with self._mutex:
+                    self._jobs.pop(request.job_id, None)
+            channel.close()
+            self._slots.release()
+
+
+def request_value(operation: str, *, job_id: str | None = None,
+                  args: dict | None = None, timeout: float = 300) -> dict:
+    value = {"schema": PROTOCOL_SCHEMA, "type": "request", "request_id": uuid.uuid4().hex,
+             "op": operation, "deadline_ms": int(timeout * 1000), "args": args or {}}
+    if job_id is not None:
+        value["job_id"] = job_id
+    ProviderRequest.from_payload(value)
+    return value
+
+
+def client_request(directory: Path, value: dict, descriptor: int | None = None) -> dict:
+    private_directory(directory)
+    path = directory / SOCKET_NAME
+    info = path.lstat()
+    if not stat.S_ISSOCK(info.st_mode) or info.st_uid != os.geteuid() or info.st_mode & 0o177:
+        raise ProtocolError("UNAUTHORIZED_PEER", "unsafe provider endpoint")
+    # The job deadline stops execution. Allow bounded supervisor teardown and
+    # the terminal error to arrive before treating the transport as failed.
+    deadline = time.monotonic() + value["deadline_ms"] / 1000 + 6
+    with socket.socket(socket.AF_UNIX, socket.SOCK_SEQPACKET) as channel:
+        channel.settimeout(max(0.001, deadline - time.monotonic()))
+        channel.connect(str(path))
+        require_same_uid_peer(channel)
+        send_packet(channel, value, descriptor)
+        for _ in range(256):
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise ProtocolError("DEADLINE_EXCEEDED", "provider deadline exceeded")
+            channel.settimeout(remaining)
+            event, descriptors = receive_packet(channel)
+            try:
+                if (event.get("schema") != PROTOCOL_SCHEMA
+                        or event.get("request_id") != value["request_id"]
+                        or event.get("job_id") != value.get("job_id")):
+                    raise ProtocolError("INVALID_RESPONSE", "unbound provider response")
+                if type(event.get("type")) is not str:
+                    raise ProtocolError("INVALID_RESPONSE", "invalid event type")
+                if event.get("type") == "error":
+                    error = event.get("error")
+                    if type(error) is not dict or descriptors:
+                        raise ProtocolError("INVALID_RESPONSE", "invalid error response")
+                    code = error.get("code", "PROVIDER_ERROR")
+                    if (type(code) is not str or not 0 < len(code) <= 64
+                            or any(c not in "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_" for c in code)):
+                        code = "PROVIDER_ERROR"
+                    raise ProtocolError(code, "provider refused the request")
+                if event.get("type") in {"accepted", "queued", "loading", "progress"}:
+                    if descriptors:
+                        raise ProtocolError("DESCRIPTOR_MISMATCH", "unexpected progress descriptor")
+                    continue
+                result = event.get("result")
+                if type(result) is not dict:
+                    raise ProtocolError("INVALID_RESPONSE", "invalid result envelope")
+                if event.get("type") == "result":
+                    metadata = result.get("audio")
+                    if (len(descriptors) != 1 or type(metadata) is not dict
+                            or type(metadata.get("byte_length")) is not int
+                            or not 44 < metadata["byte_length"] <= 43_200_044):
+                        raise ProtocolError("DESCRIPTOR_MISMATCH", "invalid result audio")
+                    fd = descriptors[0]
+                    info = os.fstat(fd)
+                    if (not stat.S_ISREG(info.st_mode) or info.st_uid != os.geteuid()
+                            or info.st_size != metadata["byte_length"]
+                            or fcntl.fcntl(fd, fcntl.F_GETFL) & os.O_ACCMODE != os.O_RDONLY):
+                        raise ProtocolError("DESCRIPTOR_MISMATCH", "invalid audio file")
+                    payload = os.pread(fd, info.st_size + 1, 0)
+                    if (len(payload) != info.st_size
+                            or hashlib.sha256(payload).hexdigest() != metadata.get("sha256")):
+                        raise ProtocolError("DESCRIPTOR_MISMATCH", "audio digest mismatch")
+                    from .results import validate_result
+                    validate_result(result, value["args"], payload)
+                    return result, payload
+                if descriptors or event.get("type") not in {"hello", "status", "models", "unloaded", "canceled"}:
+                    raise ProtocolError("INVALID_RESPONSE", "unexpected provider response")
+                return result
+            finally:
+                for received in descriptors:
+                    os.close(received)
+    raise ProtocolError("LIMIT_EXCEEDED", "provider event limit exceeded")
