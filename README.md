@@ -8,14 +8,34 @@ The pinned engine is Qwen3-TTS `6cafe5582caea83df269c36b1ce62d953a9cc66b`.
 The runtime recognises the exact 0.6B/1.7B Base and CustomVoice snapshots and
 the 1.7B VoiceDesign snapshot listed in `runtime.py`. Each installation exposes
 only its model's capability: consent-attested prompt cloning, named voices,
-or voice design. The measured development path is CPU 0.6B Base. Other paths
-require their own real-model validation. No GPU or streaming profile is
+or voice design. Real CPU development jobs cover 0.6B Base, 0.6B CustomVoice
+and 1.7B VoiceDesign. Other paths require their own real-model validation.
+No GPU or streaming profile is
 advertised. Missing installations and unsupported capabilities refuse.
 
 ## Run
 
-Stage already acquired and reviewed model files, an exact source checkout,
-and a CPU Python 3.12 environment:
+The provider/client wheel has no inference dependencies. Its CPU environment
+is a separate group in the committed `uv.lock`, using uv 0.12.5 and CPython
+3.12.8. The lock pins the complete dependency graph, CPU PyTorch wheels and
+exact upstream engine commit. The upstream Gradio demonstration server is
+explicitly excluded; the provider uses only the engine API. Build tools are
+installed from the lock before third-party builds run without build isolation.
+
+Build a new environment with the release-selected uv and an already acquired
+Python 3.12.8 installation. With `--offline`, all dependency wheels and the
+pinned Git source must already be in uv's cache; missing inputs refuse:
+
+```sh
+python3 tools/build_environment.py \
+  --uv /absolute/pinned/uv \
+  --destination /absolute/private/cpu-environment --offline
+```
+
+Omitting `--offline` permits dependency acquisition during this explicit build
+step. Model files are acquired separately. Existing destinations refuse.
+Stage already acquired and reviewed model files, the exact source checkout,
+and the resulting CPU environment:
 
 ```sh
 python3 tools/stage_runtime.py \
