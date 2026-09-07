@@ -216,6 +216,8 @@ def run_job(runtime: InstalledRuntime, audio_fd: int | None, args: dict, *,
             pass_fds=descriptors, start_new_session=True,
         )
         try:
+            while descriptors:
+                os.close(descriptors.pop())
             assert process.stdin is not None
             process.stdin.write(json.dumps(job, separators=(",", ":")).encode())
             process.stdin.close()

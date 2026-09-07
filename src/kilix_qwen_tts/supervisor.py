@@ -81,6 +81,8 @@ def main():
         pass_fds=tuple(descriptors), start_new_session=True,
     )
     try:
+        for descriptor in descriptors:
+            os.close(descriptor)
         assert worker.stdin is not None
         worker.stdin.write(payload)
         worker.stdin.close()

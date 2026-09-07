@@ -177,6 +177,8 @@ class RuntimeTests(unittest.TestCase):
         while not list(self.jobs.glob('*/ready')) and time.monotonic() < deadline:
             time.sleep(0.01)
         self.assertTrue(list(self.jobs.glob('*/ready')))
+        self.assertFalse(any('memfd:kilix-qwen-runtime' in os.readlink(fd)
+                             for fd in Path('/proc/self/fd').iterdir() if fd.exists()))
         owned = []
         pending = [os.getpid()]
         while pending:

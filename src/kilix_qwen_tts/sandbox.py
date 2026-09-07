@@ -164,7 +164,10 @@ def launch(runtime, workspace: str, audio_fd: int | None, check):
         command = ["/usr/bin/python3", "-I", "-B", f"/proc/self/fd/{supervisor}",
                    "--launch-fd", str(configuration)]
         check()
-        yield command, tuple(descriptors)
+        # The spawning parent releases its copies as soon as the supervisor
+        # inherits them; keeping a multi-GiB bundle through inference would
+        # retain an unnecessary second copy after private extraction.
+        yield command, descriptors
     finally:
         for descriptor in descriptors:
             os.close(descriptor)
