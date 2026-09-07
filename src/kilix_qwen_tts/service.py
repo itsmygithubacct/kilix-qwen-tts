@@ -138,6 +138,23 @@ class Service:
         snapshot = None
         claimed = False
         started = time.monotonic()
+
+        def finish_job():
+            # A terminal event promises that another job can claim the worker.
+            # Releasing here also prevents a suspended old sender's finally
+            # from removing a later job that reuses the same client job ID.
+            nonlocal snapshot, descriptors, claimed
+            if snapshot is not None:
+                os.close(snapshot)
+                snapshot = None
+            for descriptor in descriptors:
+                os.close(descriptor)
+            descriptors = ()
+            if claimed:
+                with self._mutex:
+                    self._jobs.pop(request.job_id, None)
+                    claimed = False
+
         try:
             channel.settimeout(2)
             require_same_uid_peer(channel)
@@ -205,12 +222,14 @@ class Service:
                     result_fd = os.open(f"/proc/self/fd/{writer.fileno()}", os.O_RDONLY | os.O_CLOEXEC)
                     try:
                         metadata = result
+                        finish_job()
                         send_packet(channel, _reply(request, "result", metadata), result_fd)
                     finally:
                         os.close(result_fd)
                 return
             send_packet(channel, _reply(request, kind, result))
         except (ProtocolError, OSError, ValueError, KeyError) as error:
+            finish_job()
             if request is not None:
                 code = error.code if isinstance(error, ProtocolError) else "PROVIDER_ERROR"
                 event = _reply(request, "error", {})
@@ -222,13 +241,7 @@ class Service:
                 except (ProtocolError, OSError):
                     pass
         finally:
-            if snapshot is not None:
-                os.close(snapshot)
-            for descriptor in descriptors:
-                os.close(descriptor)
-            if claimed:
-                with self._mutex:
-                    self._jobs.pop(request.job_id, None)
+            finish_job()
             channel.close()
             self._slots.release()
 

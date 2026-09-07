@@ -126,6 +126,90 @@ class RuntimeTests(unittest.TestCase):
             self.thread.join(5)
             self.assertFalse(self.thread.is_alive())
 
+    def test_old_sender_cannot_release_reused_job_id(self):
+        import concurrent.futures
+        import kilix_qwen_tts.service as service_module
+        self.start()
+        original_send = service_module.send_packet
+        original_run = service_module.run_job
+        resume_old = threading.Event()
+        resume_new = threading.Event()
+        new_running = threading.Event()
+        old_threads = []
+        calls = 0
+        def run(*args, **kwargs):
+            nonlocal calls
+            calls += 1
+            if calls == 2:
+                new_running.set()
+                resume_new.wait(5)
+            return original_run(*args, **kwargs)
+        def send(channel, value, descriptor=None):
+            original_send(channel, value, descriptor)
+            if value.get('job_id') == 'reused-id' and value['type'] == 'result' and not old_threads:
+                old_threads.append(threading.current_thread())
+                resume_old.wait(5)
+        with patch.object(service_module, 'send_packet', side_effect=send), \
+             patch.object(service_module, 'run_job', side_effect=run), \
+             self.audio.open('rb') as audio, \
+             concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
+            request = request_value('submit', job_id='reused-id', args=self.arguments(), timeout=5)
+            try:
+                client_request(self.ipc, request, audio.fileno())
+                future = pool.submit(client_request, self.ipc, request, audio.fileno())
+                self.assertTrue(new_running.wait(2))
+                resume_old.set()
+                self.assertEqual(len(old_threads), 1)
+                old_threads[0].join(2)
+                self.assertFalse(old_threads[0].is_alive())
+                status = client_request(self.ipc, request_value('status'))
+                self.assertEqual(status['provider_state'], 'busy')
+                resume_new.set()
+                future.result(timeout=5)
+            finally:
+                resume_old.set()
+                resume_new.set()
+
+    def test_terminal_releases_slot_before_sender_resumes(self):
+        import kilix_qwen_tts.service as service_module
+        self.start()
+        original_send = service_module.send_packet
+        original_run = service_module.run_job
+        for failing in (False, True):
+            with self.subTest(failing=failing):
+                resume = threading.Event()
+                emitted = threading.Event()
+                job = 'paused-terminal-' + str(int(failing))
+                def run(*args, **kwargs):
+                    if failing:
+                        raise ProtocolError('PROVIDER_ERROR', 'synthetic worker failure')
+                    return original_run(*args, **kwargs)
+                def send(channel, value, descriptor=None):
+                    original_send(channel, value, descriptor)
+                    if value.get('job_id') == job and value['type'] in {'result', 'error'}:
+                        emitted.set()
+                        resume.wait(5)
+                try:
+                    with patch.object(service_module, 'send_packet', side_effect=send), \
+                         patch.object(service_module, 'run_job', side_effect=run):
+                        request = request_value('submit', job_id=job,
+                                                args=self.arguments(), timeout=5)
+                        with self.audio.open('rb') as audio:
+                            if failing:
+                                with self.assertRaises(ProtocolError):
+                                    client_request(self.ipc, request, audio.fileno())
+                            else:
+                                client_request(self.ipc, request, audio.fileno())
+                        self.assertTrue(emitted.wait(1))
+                        status = client_request(self.ipc, request_value('status'))
+                        self.assertEqual(status['provider_state'], 'ready')
+                        client_request(self.ipc, request_value('unload'))
+                finally:
+                    resume.set()
+                    until = time.monotonic() + 2
+                    while self.service._jobs and time.monotonic() < until:
+                        time.sleep(.001)
+
     def test_service_binds_prompt_consent_and_wav_result(self):
         self.start()
         value = request_value('submit', job_id='fake-job', args=self.arguments(), timeout=5)
