@@ -3,10 +3,12 @@ from contextlib import contextmanager
 import copy
 from datetime import datetime, timezone
 import hashlib
+import json
 import os
 from pathlib import Path
 import socket
 import subprocess
+import struct
 import tempfile
 import threading
 import time
@@ -15,7 +17,7 @@ import unittest
 from unittest.mock import patch
 
 from kilix_qwen_tts.protocol import ProtocolError, receive_packet, send_packet
-from kilix_qwen_tts.runtime import ENGINE_COMMIT, run_job, tree_digest
+from kilix_qwen_tts.runtime import ENGINE_COMMIT, MODEL_CANDIDATES, RUNTIME_SCHEMA, InstalledRuntime, run_job, tree_digest
 from kilix_qwen_tts.sandbox import BUNDLE_MAGIC, RECORD, launch, memory_file, seal, snapshot
 from kilix_qwen_tts.service import Service, client_request, request_value
 
@@ -260,6 +262,72 @@ class RuntimeTests(unittest.TestCase):
         result['audio']['sha256'] = hashlib.sha256(invalid).hexdigest()
         with self.assertRaises(ProtocolError):
             validate_result(result, arguments, invalid)
+        for size in (1, 0xffffffff):
+            invalid = audio[:4] + struct.pack('<I', size) + audio[8:]
+            result['audio']['sha256'] = hashlib.sha256(invalid).hexdigest()
+            with self.subTest(riff_size=size), self.assertRaises(ProtocolError):
+                validate_result(result, arguments, invalid)
+
+    def test_client_binds_terminal_kind_to_operation(self):
+        arguments = self.arguments()
+        with self.audio.open('rb') as source:
+            result, audio = run_job(self.runtime, source.fileno(), arguments,
+                                   deadline=time.monotonic() + 5, cancel=threading.Event())
+        result.pop('conditioning')
+        result['model_id'] = 'qwen3-tts-0.6b-customvoice'
+        result['model_revision'] = MODEL_CANDIDATES[result['model_id']][0]
+        for operation, kind in (('status', 'models'), ('unload', 'canceled'),
+                                ('submit', 'status'), ('status', 'result')):
+            with self.subTest(operation=operation, kind=kind):
+                endpoint = self.ipc / 'kilix-qwen-tts.sock'
+                with socket.socket(socket.AF_UNIX, socket.SOCK_SEQPACKET) as listener:
+                    listener.bind(str(endpoint))
+                    endpoint.chmod(0o600)
+                    listener.listen(1)
+                    def reply():
+                        with listener.accept()[0] as channel:
+                            request, descriptors = receive_packet(channel)
+                            for fd in descriptors:
+                                os.close(fd)
+                            event = {'schema': request['schema'], 'request_id': request['request_id'],
+                                     'job_id': request.get('job_id'), 'type': kind, 'result': result if kind == 'result' else {}}
+                            with tempfile.TemporaryFile() as output:
+                                output.write(audio)
+                                output.flush()
+                                fd = os.open(f'/proc/self/fd/{output.fileno()}', os.O_RDONLY | os.O_CLOEXEC)
+                                try:
+                                    send_packet(channel, event, fd if kind == 'result' else None)
+                                finally:
+                                    os.close(fd)
+                    thread = threading.Thread(target=reply)
+                    thread.start()
+                    try:
+                        request = request_value(operation, job_id='job' if operation == 'submit' else None,
+                                                args=arguments if operation == 'submit' else None)
+                        with self.assertRaises(ProtocolError):
+                            client_request(self.ipc, request)
+                    finally:
+                        thread.join(2)
+                        self.assertFalse(thread.is_alive())
+                        endpoint.unlink()
+
+    def test_manifest_empty_file_name_is_a_stable_refusal(self):
+        names = ['config.json', 'generation_config.json', 'model.safetensors', 'preprocessor_config.json',
+                 'tokenizer_config.json', 'vocab.json', 'merges.txt', 'speech_tokenizer/config.json',
+                 'speech_tokenizer/model.safetensors', 'speech_tokenizer/preprocessor_config.json']
+        files = {}
+        for name in names:
+            path = self.installation / 'model' / name
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_bytes(b'fixture')
+            files['model/' + name] = hashlib.sha256(b'fixture').hexdigest()
+        files[''] = '0' * 64
+        manifest = {'schema': RUNTIME_SCHEMA, 'engine_revision': ENGINE_COMMIT, 'device': 'cpu',
+                    'model': {'id': self.runtime.model_id, 'revision': self.runtime.model_revision},
+                    'files': files, 'environment': {}}
+        (self.installation / 'runtime.json').write_text(json.dumps(manifest))
+        with self.assertRaises(ProtocolError):
+            InstalledRuntime(self.installation)
 
     def test_fifo_snapshot_refuses_and_snapshot_is_sealed(self):
         fifo = self.root / 'fifo'

@@ -280,9 +280,13 @@ def client_request(directory: Path, value: dict, descriptor: int | None = None) 
                         code = "PROVIDER_ERROR"
                     raise ProtocolError(code, "provider refused the request")
                 if event.get("type") in {"accepted", "queued", "loading", "progress"}:
-                    if descriptors:
+                    if descriptors or value["op"] != "submit":
                         raise ProtocolError("DESCRIPTOR_MISMATCH", "unexpected progress descriptor")
                     continue
+                expected = {"hello": "hello", "models": "models", "status": "status",
+                            "cancel": "canceled", "unload": "unloaded", "submit": "result"}
+                if event.get("type") != expected.get(value["op"]):
+                    raise ProtocolError("INVALID_RESPONSE", "terminal event does not match the operation")
                 result = event.get("result")
                 if type(result) is not dict:
                     raise ProtocolError("INVALID_RESPONSE", "invalid result envelope")

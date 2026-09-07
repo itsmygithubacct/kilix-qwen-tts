@@ -9,7 +9,6 @@ licence receipt.
 from __future__ import annotations
 
 import hashlib
-import io
 import json
 import os
 from pathlib import Path
@@ -18,7 +17,6 @@ import subprocess
 import tempfile
 import threading
 import time
-import wave
 from typing import Callable
 
 from .protocol import ProtocolError, decode_payload
@@ -123,7 +121,8 @@ class InstalledRuntime:
             raise ProtocolError("INVALID_RUNTIME", "incomplete model file population")
         for name, expected in files.items():
             relative = Path(name)
-            if (relative.is_absolute() or ".." in relative.parts or relative.parts[0] != "model"
+            if (not relative.parts or str(relative) != name or relative.is_absolute()
+                    or ".." in relative.parts or relative.parts[0] != "model"
                     or any((root / Path(*relative.parts[:i])).is_symlink()
                            for i in range(1, len(relative.parts) + 1))):
                 raise ProtocolError("INVALID_RUNTIME", "unsafe model file path")
@@ -268,15 +267,10 @@ def run_job(runtime: InstalledRuntime, audio_fd: int | None, args: dict, *,
             if (type(result["audio"]["byte_length"]) is not int or result["audio"]["byte_length"] != len(payload)
                     or result["audio"].get("sha256") != hashlib.sha256(payload).hexdigest()):
                 raise ProtocolError("MALFORMED_WORKER_RESULT", "audio metadata does not match output")
+            from .results import validate_wave
             try:
-                with wave.open(io.BytesIO(payload), "rb") as audio:
-                    if (audio.getnchannels(), audio.getframerate(), audio.getsampwidth(), audio.getcomptype()) != (1, 24000, 2, "NONE"):
-                        raise ValueError("invalid PCM format")
-                    if audio.getnframes() != result["duration_ms"] * 24:
-                        raise ValueError("invalid PCM duration")
-                    if len(audio.readframes(audio.getnframes())) != audio.getnframes() * 2:
-                        raise ValueError("truncated PCM")
-            except (EOFError, wave.Error, ValueError) as error:
+                validate_wave(payload, result["duration_ms"])
+            except ProtocolError as error:
                 raise ProtocolError("MALFORMED_WORKER_RESULT", "invalid synthesized WAV") from error
             return result, payload
         finally:

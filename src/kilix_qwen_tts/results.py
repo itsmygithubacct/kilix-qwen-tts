@@ -4,6 +4,7 @@ from __future__ import annotations
 import hashlib
 import io
 import json
+import struct
 import wave
 
 from .protocol import ProtocolError
@@ -35,11 +36,18 @@ def validate_result(result: dict, arguments: dict, payload: bytes) -> None:
                     'consent_sha256': hashlib.sha256(consent).hexdigest()}
         if result['conditioning'] != expected:
             raise ProtocolError('INVALID_RESPONSE', 'unbound prompt or consent result')
+    validate_wave(payload, result['duration_ms'])
+
+
+def validate_wave(payload: bytes, duration_ms: int) -> None:
     try:
+        if (len(payload) < 44 or payload[:4] != b'RIFF' or payload[8:12] != b'WAVE'
+                or struct.unpack_from('<I', payload, 4)[0] != len(payload) - 8):
+            raise ValueError('invalid RIFF container size')
         with wave.open(io.BytesIO(payload), 'rb') as audio:
             if (audio.getnchannels(), audio.getframerate(), audio.getsampwidth(), audio.getcomptype()) != (1, 24000, 2, 'NONE'):
                 raise ValueError('invalid audio format')
-            if audio.getnframes() != result['duration_ms'] * 24 or len(payload) != 44 + audio.getnframes() * 2:
+            if audio.getnframes() != duration_ms * 24 or len(payload) != 44 + audio.getnframes() * 2:
                 raise ValueError('invalid canonical audio size or duration')
             if len(audio.readframes(audio.getnframes())) != audio.getnframes() * 2:
                 raise ValueError('truncated audio')
