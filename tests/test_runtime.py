@@ -20,7 +20,12 @@ from kilix_qwen_tts.sandbox import BUNDLE_MAGIC, RECORD, launch, memory_file, se
 from kilix_qwen_tts.service import Service, client_request, request_value
 
 ENGINE = '''#!/usr/bin/python3
-import hashlib,json,os,pathlib,signal,subprocess,sys,time,wave
+import hashlib,json,os,pathlib,resource,signal,subprocess,sys,time,wave
+assert resource.getrlimit(resource.RLIMIT_AS)==(20*1024**3,20*1024**3)
+assert resource.getrlimit(resource.RLIMIT_CPU)==(3600,3600)
+assert resource.getrlimit(resource.RLIMIT_FSIZE)==(64*1024**2,64*1024**2)
+assert resource.getrlimit(resource.RLIMIT_NOFILE)==(128,128)
+assert resource.getrlimit(resource.RLIMIT_CORE)==(0,0)
 request=json.load(sys.stdin);args=request['args']
 assert pathlib.Path('/opt/runtime/model/data').read_bytes()==b'model bytes'
 assert pathlib.Path('/opt/python/lib/python3.12/site-packages/data').read_bytes()==b'dependency bytes'

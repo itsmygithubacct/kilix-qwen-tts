@@ -10,6 +10,7 @@ import ctypes
 import fcntl
 import os
 from pathlib import Path
+import resource
 import struct
 import sys
 
@@ -97,6 +98,14 @@ def main():
     libc = prepare_mount()
     unpack(int(sys.argv[1]))
     seal_mount_and_drop_capabilities(libc)
+    # Set hard ceilings in the trusted system interpreter, before the staged
+    # interpreter or any site/dependency startup code can execute. Extraction
+    # above has its own file/population/tmpfs bounds and needs larger files.
+    resource.setrlimit(resource.RLIMIT_CORE, (0, 0))
+    resource.setrlimit(resource.RLIMIT_AS, (20 * 1024**3, 20 * 1024**3))
+    resource.setrlimit(resource.RLIMIT_CPU, (3600, 3600))
+    resource.setrlimit(resource.RLIMIT_FSIZE, (64 * 1024**2, 64 * 1024**2))
+    resource.setrlimit(resource.RLIMIT_NOFILE, (128, 128))
     executable = "/opt/python/bin/python3.12"
     os.execv(executable, [executable, "-I", "-B", "/opt/provider/kilix_qwen_tts/supervisor.py"])
     return 125

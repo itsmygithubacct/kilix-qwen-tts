@@ -76,7 +76,8 @@ duration limit fails instead of presenting capped audio as complete.
 Each job snapshots up to 40,000 regular files and 7 GiB of runtime bytes; the
 private extraction also consumes memory. These bounds are controls, not a
 qualified RAM profile. Snapshot copy work observes cancellation/deadlines.
-The inference worker has CPU, address-space, file-size and descriptor limits.
+The trusted bootstrap applies hard CPU, address-space, file-size and descriptor
+limits before executing the staged interpreter; all model code inherits them.
 A crash, timeout, disconnect or canceled job releases its worker slot.
 
 ## Checks and qualification
