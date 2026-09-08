@@ -34,6 +34,11 @@ python3 tools/build_environment.py \
 
 Omitting `--offline` permits dependency acquisition during this explicit build
 step. Model files are acquired separately. Existing destinations refuse.
+Destination ancestors must be real directories owned by the caller or root,
+without group/world write access except root-owned sticky temporary directories.
+The builder pins their identities and refuses symlinks or path replacement.
+`--timeout` bounds the whole build (1,800 seconds by default, at most 3,600).
+Cancellation reaps the build's descendants before removing its staging files.
 Stage already acquired and reviewed model files, the exact source checkout,
 and the resulting CPU environment:
 
