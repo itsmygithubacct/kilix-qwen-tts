@@ -194,15 +194,18 @@ def stop_process(process: subprocess.Popen) -> None:
 def run_job(runtime: InstalledRuntime, audio_fd: int | None, args: dict, *,
             deadline: float, cancel: threading.Event,
             disconnected: Callable[[], bool] = lambda: False,
-            execution_policy=None, job_id=None, progress=None, on_chunk=None) -> tuple[dict, bytes]:
+            execution_policy=None, job_id=None, progress=None, on_chunk=None,
+            prompt_embedding=None, on_embedding=None) -> tuple[dict, bytes]:
     from .owned import OwnedExecution
     with OwnedExecution(execution_policy, job_id=job_id, workload="tts-utterance", deadline=deadline,
                         cancelled=cancel.is_set, disconnected=disconnected, progress=progress) as owner:
         return _run_owned_job(runtime, audio_fd, args, deadline=deadline, cancel=cancel,
-                              disconnected=disconnected, owner=owner, on_chunk=on_chunk)
+                              disconnected=disconnected, owner=owner, on_chunk=on_chunk,
+                              prompt_embedding=prompt_embedding, on_embedding=on_embedding)
 
 
-def _run_owned_job(runtime, audio_fd, args, *, deadline, cancel, disconnected, owner, on_chunk=None):
+def _run_owned_job(runtime, audio_fd, args, *, deadline, cancel, disconnected, owner, on_chunk=None,
+                   prompt_embedding=None, on_embedding=None):
     if cancel.is_set() or disconnected():
         raise ProtocolError("CANCELED", "job canceled")
     if time.monotonic() >= deadline:
@@ -227,9 +230,15 @@ def _run_owned_job(runtime, audio_fd, args, *, deadline, cancel, disconnected, o
                    "OMP_NUM_THREADS": "2", "OPENBLAS_NUM_THREADS": "2",
                    "HF_HUB_OFFLINE": "1", "TRANSFORMERS_OFFLINE": "1",
                    "PYTHONDONTWRITEBYTECODE": "1", "TOKENIZERS_PARALLELISM": "false"}
-    with tempfile.TemporaryDirectory(prefix="kilix-qwen-job-") as workspace, tempfile.TemporaryFile() as output, launch(runtime, workspace, audio_fd, check) as (command, descriptors):
+    if (on_embedding is not None and (not callable(on_embedding) or args["mode"] != "prompt_clone")
+            or prompt_embedding is not None and on_embedding is None):
+        raise ProtocolError("INVALID_REQUEST", "invalid prompt cache selection")
+    cache_options = {"prompt_embedding": prompt_embedding} if prompt_embedding is not None else {}
+    with tempfile.TemporaryDirectory(prefix="kilix-qwen-job-") as workspace, tempfile.TemporaryFile() as output, launch(runtime, workspace, audio_fd, check, **cache_options) as (command, descriptors):
         job = {"runtime": "/opt/runtime", "manifest": runtime.manifest,
                "audio_fd": None, "args": args, "workspace": "/job"}
+        if on_embedding is not None:
+            job.update(prompt_cache=True, prompt_cache_input=prompt_embedding is not None)
         stream = None
         if on_chunk is not None:
             from .streaming import WorkerStreamReader
@@ -306,6 +315,10 @@ def _run_owned_job(runtime, audio_fd, args, *, deadline, cancel, disconnected, o
                 raise ProtocolError("MALFORMED_WORKER_RESULT", "invalid synthesized WAV") from error
             if stream is not None:
                 stream.require_audio(payload)
+            if on_embedding is not None:
+                from .prompt_cache import read_embedding
+                check()
+                on_embedding(read_embedding(Path(workspace) / "prompt.embedding"))
             return result, payload
         finally:
             owner.finish(process, stop_process)

@@ -273,3 +273,30 @@ generation; that duplicate work has not been optimized away. The first real
 0.6B named-voice CPU development run delivered five chunks, with the first at
 71.774 seconds and completion at 149.748 seconds on a shared host. These are
 observations from one draft run, not latency or memory qualification.
+
+
+## Optional prompt embedding cache
+
+`serve --prompt-cache` enables an in-memory LRU cache of at most eight
+4,104-byte speaker embeddings. Entries expire after five idle minutes; the
+service checks expiration while idle. `unload` and service shutdown discard
+all entries. There is no persistent cache, model retention, raw recording cache
+or unsafe tensor deserialization. This option defaults off.
+
+Each entry is scoped to the connected peer's kernel PID/UID/GID and process
+start identity, the complete selected runtime/model revision and byte digests,
+actual prompt PCM metadata/digest, and its permitted-use scope. A missing or
+exited peer identity bypasses caching. Different client processes cannot reuse
+one another's entries. Every request still verifies its current consent and
+actual prompt descriptor, and every job repeats installed-asset authority and
+runtime byte checks. A new consent timestamp does not change the numerical
+embedding or permitted-use scope; that request's fresh consent digest remains
+bound to its own result. Text and seeds are not embedding inputs.
+
+Only a validated final result with proved owned cleanup can populate the
+cache. Cached input is included in the same sealed runtime bundle and is read
+only inside the private namespace. The worker accepts exactly 1,024 bounded
+finite float32 values in a fixed binary encoding, and never loads an arbitrary
+Python or pickle object. Prompt construction preserves the generation RNG.
+The cache holds CPU data only; it does not establish a supported memory profile
+or imply any measured GPU eviction behavior.

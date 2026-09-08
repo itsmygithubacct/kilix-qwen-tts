@@ -39,6 +39,11 @@ def main() -> None:
         from kilix_qwen_tts.streaming import WorkerStream
         stream = WorkerStream(sys.stdout.buffer)
     args = request["args"]
+    cache = request.get("prompt_cache", False)
+    cached = request.get("prompt_cache_input", False)
+    if (type(cache) is not bool or type(cached) is not bool or cached and not cache
+            or cache and args["mode"] != "prompt_clone"):
+        raise ValueError("invalid prompt cache selection")
     root = Path(request["runtime"])
     manifest = request["manifest"]
     workspace = Path(request["workspace"])
@@ -88,9 +93,30 @@ def main() -> None:
             consent = json.dumps(args["consent"], separators=(",", ":"), sort_keys=True).encode()
             conditioning = {"prompt_sha256": prompt["sha256"],
                             "consent_sha256": hashlib.sha256(consent).hexdigest()}
-            waves, sample_rate = model.generate_voice_clone(
-                **options, ref_audio=(audio, prompt["sample_rate_hz"]), x_vector_only_mode=True,
-            )
+            if cache:
+                from qwen_tts import VoiceClonePromptItem
+                from kilix_qwen_tts.prompt_cache import DIMENSIONS, ENCODING, MAGIC, read_embedding, validate_embedding
+                if model.model.config.speaker_encoder_config.enc_dim != DIMENSIONS:
+                    raise ValueError("unsupported speaker embedding shape")
+                if cached:
+                    saved = read_embedding("/opt/prompt.embedding", readonly_mount=True)
+                    embedding = torch.tensor(ENCODING.unpack(saved[len(MAGIC):]), dtype=torch.float32, device="cpu")
+                    items = [VoiceClonePromptItem(None, embedding, True, False, None)]
+                else:
+                    with torch.random.fork_rng(devices=[]):
+                        items = model.create_voice_clone_prompt(ref_audio=(audio, prompt["sample_rate_hz"]), x_vector_only_mode=True)
+                if (len(items) != 1 or tuple(items[0].ref_spk_embedding.shape) != (DIMENSIONS,)
+                        or items[0].ref_spk_embedding.dtype != torch.float32 or items[0].ref_spk_embedding.device.type != "cpu"
+                        or items[0].ref_code is not None or items[0].x_vector_only_mode is not True
+                        or items[0].icl_mode is not False or items[0].ref_text is not None):
+                    raise ValueError("invalid cached prompt shape")
+                saved = validate_embedding(MAGIC + ENCODING.pack(*items[0].ref_spk_embedding.detach().tolist()))
+                (workspace / "prompt.embedding").write_bytes(saved)
+                waves, sample_rate = model.generate_voice_clone(**options, voice_clone_prompt=items)
+            else:
+                waves, sample_rate = model.generate_voice_clone(
+                    **options, ref_audio=(audio, prompt["sample_rate_hz"]), x_vector_only_mode=True,
+                )
         elif args["mode"] == "named_voice":
             waves, sample_rate = model.generate_custom_voice(
                 **options, speaker=args["voice_id"], instruct=args.get("instruction", ""),

@@ -47,7 +47,8 @@ def unpack(descriptor):
             name = exact(source, name_size).decode("utf-8")
             relative = Path(name)
             if (relative.is_absolute() or str(relative) != name or ".." in relative.parts
-                    or "\0" in name or relative.parts[0] not in {"python", "runtime", "provider", "prompt.pcm"}):
+                    or "\0" in name or relative.parts[0] not in {"python", "runtime", "provider", "prompt.pcm", "prompt.embedding"}
+                    or relative.parts[0] == "prompt.embedding" and (name != "prompt.embedding" or size != 4104 or executable)):
                 raise ValueError("unsafe runtime bundle path")
             count += 1
             total += size

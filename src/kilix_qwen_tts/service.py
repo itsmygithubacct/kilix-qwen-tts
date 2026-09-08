@@ -50,7 +50,11 @@ def _reply(request: ProviderRequest, kind: str, result: dict) -> dict:
 
 
 class Service:
-    def __init__(self, runtime: InstalledRuntime, directory: Path, *, additional_runtimes=(), execution_policy=None):
+    def __init__(self, runtime: InstalledRuntime, directory: Path, *, additional_runtimes=(), execution_policy=None, prompt_cache=False):
+        if type(prompt_cache) is not bool:
+            raise ProtocolError("INVALID_REQUEST", "invalid prompt cache selection")
+        from .prompt_cache import PromptCache
+        self._prompt_cache = PromptCache() if prompt_cache else None
         self.runtime = runtime
         self.execution_policy = execution_policy
         self._unavailable = False
@@ -87,6 +91,8 @@ class Service:
 
     def stop(self) -> None:
         self.stopping.set()
+        if self._prompt_cache is not None:
+            self._prompt_cache.clear()
         with self._mutex:
             for cancellation in self._jobs.values():
                 cancellation.set()
@@ -131,6 +137,8 @@ class Service:
             listener.settimeout(0.2)
             self.ready.set()
             while not self.stopping.is_set():
+                if self._prompt_cache is not None:
+                    self._prompt_cache.expire()
                 try:
                     channel, _ = listener.accept()
                 except TimeoutError:
@@ -147,6 +155,8 @@ class Service:
             listener.close()
             for thread in self._threads:
                 thread.join()
+            if self._prompt_cache is not None:
+                self._prompt_cache.clear()
             if bound is not None:
                 try:
                     current = self.path.lstat()
@@ -240,6 +250,8 @@ class Service:
                         raise ProtocolError("SUPERVISOR_FAILED", "owned cleanup remains unproven")
                     if self._jobs:
                         raise ProtocolError("BUSY", "cannot unload during a job")
+                if self._prompt_cache is not None:
+                    self._prompt_cache.clear()
                 result = {"loaded": False}
                 kind = "unloaded"
             else:
@@ -262,10 +274,25 @@ class Service:
                         finally:
                             os.close(descriptor)
                 stream_options = {"on_chunk": chunk} if streaming else {}
+                cache_key = None
+                produced_embeddings = []
+                if self._prompt_cache is not None and request.arguments["mode"] == "prompt_clone":
+                    from .prompt_cache import peer_scope, prompt_key
+                    cache_key = prompt_key(peer_scope(channel), selected_runtime.manifest, request.arguments)
+                    if cache_key is not None:
+                        stream_options.update(prompt_embedding=self._prompt_cache.get(cache_key),
+                                              on_embedding=produced_embeddings.append)
                 result, payload = run_job(selected_runtime, snapshot, request.arguments,
                                  deadline=deadline, cancel=cancellation,
                                  execution_policy=self.execution_policy, job_id=request.job_id, progress=queued,
                                  disconnected=lambda: self.stopping.is_set() or _closed(channel), **stream_options)
+                if cache_key is not None:
+                    if len(produced_embeddings) != 1:
+                        raise ProtocolError("MALFORMED_WORKER_RESULT", "missing speaker embedding")
+                    # run_job has validated the final audio and completed owned
+                    # teardown. A failed/canceled job can never populate cache.
+                    if not self.stopping.is_set():
+                        self._prompt_cache.put(cache_key, produced_embeddings[0])
                 # Canonical audio is returned in one read-only descriptor.
                 with tempfile.TemporaryFile() as writer:
                     writer.write(payload)

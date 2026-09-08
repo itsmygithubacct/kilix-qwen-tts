@@ -81,7 +81,7 @@ def snapshot(source: Path, check):
 
 
 @contextmanager
-def launch(runtime, workspace: str, audio_fd: int | None, check):
+def launch(runtime, workspace: str, audio_fd: int | None, check, *, prompt_embedding=None):
     """Verify actual copied bytes, then unpack only that immutable population."""
     # System launcher/interpreter/libraries are root-owned inputs. No caller-
     # writable Python, package, model or prompt path is exposed to the worker.
@@ -152,6 +152,14 @@ def launch(runtime, workspace: str, audio_fd: int | None, check):
             add(path, "provider/kilix_qwen_tts/" + path.name)
         if audio_fd is not None:
             add(Path(f"/proc/self/fd/{audio_fd}"), "prompt.pcm")
+        if prompt_embedding is not None:
+            from .prompt_cache import validate_embedding
+            payload = validate_embedding(prompt_embedding)
+            name = b"prompt.embedding"
+            total_bytes += len(payload)
+            if total_bytes > MAX_BUNDLE_BYTES or len(names) >= MAX_FILES:
+                raise ProtocolError("LIMIT_EXCEEDED", "runtime snapshot exceeds its bound")
+            _write(bundle, RECORD.pack(len(name), len(payload), False) + name + payload)
         _write(bundle, RECORD.pack(0, 0, 0))
         seal(bundle)
         bootstrap, _, _ = snapshot(Path(__file__).with_name("bootstrap.py"), check)

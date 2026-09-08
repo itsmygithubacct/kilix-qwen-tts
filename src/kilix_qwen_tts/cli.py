@@ -31,6 +31,8 @@ def parser():
             sub.add_argument("--installed-asset")
             sub.add_argument("--content-root", type=Path)
             sub.add_argument("--model-snapshot-bytes", type=int)
+            sub.add_argument("--prompt-cache", action="store_true",
+                             help="retain up to eight process-scoped speaker embeddings for five idle minutes")
             sub.add_argument("--lease-device")
             sub.add_argument("--lease-namespace")
         elif command == "synthesize":
@@ -88,7 +90,7 @@ def main(argv=None):
             from .selection import installed_runtimes
             with installed_runtimes(args.runtime_index, args.content_root) as runtimes:
                 service = Service(runtimes[0], runtime_directory(), additional_runtimes=runtimes[1:],
-                                  execution_policy=execution_policy)
+                                  execution_policy=execution_policy, prompt_cache=args.prompt_cache)
                 for sig in (signal.SIGINT, signal.SIGTERM):
                     signal.signal(sig, lambda _sig, _frame: service.stop())
                 service.serve()
@@ -100,7 +102,7 @@ def main(argv=None):
         if args.command == "serve" and args.runtime_root is not None:
             with model_source if model_source is not None else nullcontext():
                 service = Service(InstalledRuntime(args.runtime_root, model_source=model_source), runtime_directory(),
-                                  execution_policy=execution_policy)
+                                  execution_policy=execution_policy, prompt_cache=args.prompt_cache)
                 for sig in (signal.SIGINT, signal.SIGTERM):
                     signal.signal(sig, lambda _sig, _frame: service.stop())
                 service.serve()
