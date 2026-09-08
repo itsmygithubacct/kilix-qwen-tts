@@ -303,3 +303,18 @@ finite float32 values in a fixed binary encoding, and never loads an arbitrary
 Python or pickle object. Prompt construction preserves the generation RNG.
 The cache holds CPU data only; it does not establish a supported memory profile
 or imply any measured GPU eviction behavior.
+
+## Controlled client delivery
+
+The Python client accepts `client_request(..., cancelled=callback)` for submit
+operations. The callback must promptly return a boolean. Controlled calls keep
+the requested deadline and observe cancellation during receive waits. On
+cancellation the client attempts a short cancel request for that submitted job,
+closes its own channel and descriptors, and raises `CANCELED`. This is local
+cancellation: neither it nor a cancel ACK proves provider cleanup. Check provider
+status before a successor job; busy or unavailable remains authoritative. No
+background request thread is retained. Borrowed input descriptors stay open.
+The client rechecks that deadline after validation, immediately before returning
+output or invoking the PCM consumer. Expired output is refused with
+`DEADLINE_EXCEEDED`. Legacy submit calls without a cancellation callback retain
+their existing six-second supervisor grace; short control calls receive no grace.
