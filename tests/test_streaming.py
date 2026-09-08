@@ -123,6 +123,8 @@ if request.get('streaming_pcm'):
         part=pcm[offset:offset+2400]
         output.write(struct.pack('!cI',b'P',len(part))+part);output.flush()
         if offset==0:
+            if args['text']=='stream-barrier':
+                while not pathlib.Path('/job/continue').exists():time.sleep(.005)
             if args['text']=='stream-hold':time.sleep(60)
             if args['text']=='stream-truncated':raise SystemExit(0)
             time.sleep(.15)
@@ -169,13 +171,14 @@ class ProcessStreamTests(unittest.TestCase):
         with prepared() as fixture, fixture.audio.open("rb") as audio:
             chunks = []
             def consume(sequence, offset, pcm):
-                status = client_request(fixture.ipc, request_value("status"))
-                self.assertEqual(status["provider_state"], "busy")
+                if sequence == 0:
+                    status = client_request(fixture.ipc, request_value("status"))
+                    self.assertEqual(status["provider_state"], "busy")
+                    (next(fixture.jobs.iterdir()) / "continue").touch()
                 chunks.append((time.monotonic(), sequence, offset, pcm))
-            value = request_value("submit", job_id="stream", args=fixture.arguments(), timeout=5, stream=True)
+            value = request_value("submit", job_id="stream", args=fixture.arguments("stream-barrier"), timeout=5, stream=True)
             result, wave = client_request(fixture.ipc, value, audio.fileno(), on_chunk=consume)
             self.assertEqual([row[1:3] for row in chunks], [(0, 0), (1, 1200)])
-            self.assertGreater(chunks[1][0] - chunks[0][0], .08)
             self.assertEqual(b"".join(row[3] for row in chunks), wave[44:])
             self.assertEqual(result["duration_ms"], 100)
             self.assertEqual(client_request(fixture.ipc, request_value("status"))["provider_state"], "ready")
