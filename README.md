@@ -124,8 +124,8 @@ CPU path; it does not qualify the wider interface. Production asset admission,
 F106 selected resource profiles, shared accelerator admission, all-model and
 GPU measurements, perceptual review and the combined soak remain required.
 No model weights, environment binaries or user audio are committed here. The
-product wrapper's source-license grant remains an owner decision, separate
-from upstream source and model licenses.
+product wrapper's source is licensed under MIT; see [LICENSE](LICENSE).
+Upstream source, dependencies and model licenses remain separate.
 
 ## Installed model descriptors
 

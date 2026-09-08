@@ -7,6 +7,8 @@ name = "kilix-qwen-tts"
 version = "0.1.0"
 description = "Private local speech synthesis provider and bounded Python client"
 readme = "README.md"
+license = "MIT"
+license-files = ["LICENSE"]
 requires-python = ">=3.12,<3.13"
 dependencies = []
 
