@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import argparse
+from contextlib import nullcontext
 from datetime import datetime, timezone
 import hashlib
 import json
@@ -25,6 +26,9 @@ def parser():
         sub = commands.add_parser(command)
         if command == "serve":
             sub.add_argument("--runtime-root", type=Path)
+            sub.add_argument("--installed-asset")
+            sub.add_argument("--content-root", type=Path)
+            sub.add_argument("--model-snapshot-bytes", type=int)
         elif command == "synthesize":
             sub.add_argument("--output", type=Path)
             mode = sub.add_mutually_exclusive_group()
@@ -68,11 +72,16 @@ def main(argv=None):
     try:
         from .runtime import InstalledRuntime
         from .service import Service, client_request, request_value, runtime_directory
+        if args.command == "serve":
+            from .content import from_options
+            model_source = from_options(args, provider="kilix-qwen-tts",
+                                        consumer_schema="kilix.qwen-tts.runtime")
         if args.command == "serve" and args.runtime_root is not None:
-            service = Service(InstalledRuntime(args.runtime_root), runtime_directory())
-            for sig in (signal.SIGINT, signal.SIGTERM):
-                signal.signal(sig, lambda _sig, _frame: service.stop())
-            service.serve()
+            with model_source if model_source is not None else nullcontext():
+                service = Service(InstalledRuntime(args.runtime_root, model_source=model_source), runtime_directory())
+                for sig in (signal.SIGINT, signal.SIGTERM):
+                    signal.signal(sig, lambda _sig, _frame: service.stop())
+                service.serve()
             return 0
         if args.command == "synthesize" and args.output is not None:
             text = sys.stdin.buffer.read(16_385).decode("utf-8")

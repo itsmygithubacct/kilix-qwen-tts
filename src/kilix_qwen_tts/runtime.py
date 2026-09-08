@@ -90,8 +90,9 @@ MODEL_CANDIDATES = {
 
 
 class InstalledRuntime:
-    def __init__(self, root: Path):
+    def __init__(self, root: Path, *, model_source=None):
         self.root = private_directory(root)
+        self.model_source = model_source
         path = root / "runtime.json"
         descriptor = os.open(path, os.O_RDONLY | os.O_NONBLOCK | os.O_NOFOLLOW | os.O_CLOEXEC)
         with os.fdopen(descriptor, "rb") as source:
@@ -123,17 +124,25 @@ class InstalledRuntime:
             relative = Path(name)
             if (not relative.parts or str(relative) != name or relative.is_absolute()
                     or ".." in relative.parts or relative.parts[0] != "model"
-                    or any((root / Path(*relative.parts[:i])).is_symlink()
-                           for i in range(1, len(relative.parts) + 1))):
+                    or type(expected) is not str or len(expected) != 64
+                    or any(c not in "0123456789abcdef" for c in expected)):
+                raise ProtocolError("INVALID_RUNTIME", "unsafe model file path")
+            if model_source is not None:
+                continue
+            if any((root / Path(*relative.parts[:i])).is_symlink()
+                   for i in range(1, len(relative.parts) + 1)):
                 raise ProtocolError("INVALID_RUNTIME", "unsafe model file path")
             info = (root / name).lstat()
             if (not stat.S_ISREG(info.st_mode) or info.st_uid != os.geteuid()
                     or info.st_mode & 0o022 or type(expected) is not str
                     or digest_file(root / name) != expected):
                 raise ProtocolError("INVALID_RUNTIME", "model file identity mismatch")
-        actual = {str(p.relative_to(root)) for p in (root / "model").rglob("*") if not p.is_dir()}
-        if actual != set(files):
-            raise ProtocolError("INVALID_RUNTIME", "unrecorded model file")
+        if model_source is None:
+            actual = {str(p.relative_to(root)) for p in (root / "model").rglob("*") if not p.is_dir()}
+            if actual != set(files):
+                raise ProtocolError("INVALID_RUNTIME", "unrecorded model file")
+        else:
+            model_source.bind(model["id"], model["revision"], files)
         environment = value["environment"]
         if (type(environment) is not dict
                 or set(environment) != {"python", "python_sha256", "site_packages", "site_packages_sha256",
@@ -153,9 +162,10 @@ class InstalledRuntime:
         self.verify_unchanged()
 
     def verify_unchanged(self, check: Callable[[], None] = lambda: None) -> None:
-        for name, digest in self.manifest["files"].items():
-            if (self.root / name).is_symlink() or digest_file(self.root / name, check) != digest:
-                raise ProtocolError("INVALID_RUNTIME", "model changed; restart required")
+        if self.model_source is None:
+            for name, digest in self.manifest["files"].items():
+                if (self.root / name).is_symlink() or digest_file(self.root / name, check) != digest:
+                    raise ProtocolError("INVALID_RUNTIME", "model changed; restart required")
         environment = self.manifest["environment"]
         if (digest_file(self.python, check) != environment["python_sha256"]
                 or tree_digest(self.site_packages, check) != environment["site_packages_sha256"]

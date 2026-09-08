@@ -132,9 +132,22 @@ def launch(runtime, workspace: str, audio_fd: int | None, check):
         environment = runtime.manifest["environment"]
         tree(runtime.python_root, "python", environment["python_root_sha256"], True)
         tree(runtime.site_packages, "python/lib/python3.12/site-packages", environment["site_packages_sha256"])
-        for name, expected in runtime.manifest["files"].items():
-            if add(runtime.root / name, "runtime/" + name) != expected:
-                raise ProtocolError("INVALID_RUNTIME", "model snapshot digest mismatch")
+        model_source = getattr(runtime, "model_source", None)
+        if model_source is None:
+            for name, expected in runtime.manifest["files"].items():
+                if add(runtime.root / name, "runtime/" + name) != expected:
+                    raise ProtocolError("INVALID_RUNTIME", "model snapshot digest mismatch")
+        else:
+            with model_source.open(check) as asset:
+                for name, expected in runtime.manifest["files"].items():
+                    descriptor = model_source.descriptor(asset, name, check)
+                    try:
+                        if add(Path(f"/proc/self/fd/{descriptor}"), "runtime/" + name) != expected:
+                            raise ProtocolError("INVALID_RUNTIME", "installed model snapshot digest mismatch")
+                    finally:
+                        os.close(descriptor)
+            # The bundle now owns the exact checked bytes. Release every F100
+            # snapshot before process startup instead of retaining two models.
         for path in sorted(Path(__file__).parent.glob("*.py")):
             add(path, "provider/kilix_qwen_tts/" + path.name)
         if audio_fd is not None:

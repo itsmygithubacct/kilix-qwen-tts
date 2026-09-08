@@ -118,9 +118,44 @@ Voicebox supports the same candidate protocol and canonical WAV result.
 
 The interface candidate in `contracts/provider-interface-candidate-v1.json`
 also describes future streaming mechanics. That interface is not a claim that
-the present batch runtime implements streaming. F100 receipt integration,
+the present batch runtime implements streaming. Production asset admission,
 F106 selected resource profiles, shared accelerator admission, all-model and
 GPU measurements, perceptual review and the combined soak remain required.
 No model weights, environment binaries or user audio are committed here. The
 product wrapper's source-license grant remains an owner decision, separate
 from upstream source and model licenses.
+
+## Installed model descriptors
+
+The service can use the reviewed `kilix-content` installed-asset API instead
+of local model paths. Provision that shared package in the provider environment,
+then select a catalog asset at service startup:
+
+```sh
+kilix-qwen-tts serve --runtime-root /absolute/runtime \
+  --installed-asset qwen3-tts-0.6b-base \
+  --content-root /absolute/installed-content \
+  --model-snapshot-bytes 3000000000
+```
+
+The byte argument is an explicit snapshot ceiling, not measured hardware
+admission. The runtime manifest still binds the exact model population and
+interpreter/dependencies. Its model files need not exist under `runtime-root`
+when this option is selected. The packaged catalog must contain the matching
+provider, consumer version, model revision and file digests; every job requires
+current durable license receipts and the complete installed population.
+No missing receipt or asset falls back to local model paths.
+
+Receipt storage opens once during service startup, under its bounded startup
+lock policy, and closes after service shutdown. Per-job receipt waits and
+snapshot reads share the job's cancellation/deadline checks, with an additional
+120-second snapshot ceiling. Read-only sealed member descriptors are checked
+and their actual bytes hashed into the immutable runtime bundle. The content
+snapshots close before process startup. No receipt is created by this provider,
+and no catalog, release identity or model path is accepted on wire.
+
+Integration tests require the reviewed `kilix-content` package on `PYTHONPATH`;
+without it, those optional tests report skips. Their synthetic packaged catalog
+fixtures exercise the production authority and storage implementation without
+admitting models to a release. Installed descriptors do not establish a
+qualified resource profile or full install-transaction authority.
