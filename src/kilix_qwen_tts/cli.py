@@ -25,7 +25,9 @@ def parser():
     for command in CLI_COMMANDS:
         sub = commands.add_parser(command)
         if command == "serve":
-            sub.add_argument("--runtime-root", type=Path)
+            selected = sub.add_mutually_exclusive_group()
+            selected.add_argument("--runtime-root", type=Path)
+            selected.add_argument("--runtime-index", type=Path)
             sub.add_argument("--installed-asset")
             sub.add_argument("--content-root", type=Path)
             sub.add_argument("--model-snapshot-bytes", type=int)
@@ -72,6 +74,17 @@ def main(argv=None):
     try:
         from .runtime import InstalledRuntime
         from .service import Service, client_request, request_value, runtime_directory
+        if args.command == "serve" and args.runtime_index is not None:
+            if (args.content_root is None or args.installed_asset is not None
+                    or args.model_snapshot_bytes is not None):
+                raise ProtocolError("INVALID_REQUEST", "runtime index requires only the shared content root")
+            from .selection import installed_runtimes
+            with installed_runtimes(args.runtime_index, args.content_root) as runtimes:
+                service = Service(runtimes[0], runtime_directory(), additional_runtimes=runtimes[1:])
+                for sig in (signal.SIGINT, signal.SIGTERM):
+                    signal.signal(sig, lambda _sig, _frame: service.stop())
+                service.serve()
+            return 0
         if args.command == "serve":
             from .content import from_options
             model_source = from_options(args, provider="kilix-qwen-tts",

@@ -18,7 +18,7 @@ from .protocol import (
     PROTOCOL_SCHEMA, ProtocolError, ProviderRequest, receive_packet,
     require_same_uid_peer, send_packet, verify_request_descriptors,
 )
-from .runtime import InstalledRuntime, MAX_INPUT_BYTES, private_directory, run_job
+from .runtime import InstalledRuntime, MAX_INPUT_BYTES, MODEL_CANDIDATES, private_directory, run_job
 
 SOCKET_NAME = "kilix-qwen-tts.sock"
 
@@ -50,8 +50,21 @@ def _reply(request: ProviderRequest, kind: str, result: dict) -> dict:
 
 
 class Service:
-    def __init__(self, runtime: InstalledRuntime, directory: Path):
+    def __init__(self, runtime: InstalledRuntime, directory: Path, *, additional_runtimes=()):
         self.runtime = runtime
+        if type(additional_runtimes) not in (tuple, list) or len(additional_runtimes) > 4:
+            raise ProtocolError("INVALID_RUNTIME", "runtime selection exceeds its bound")
+        self.runtimes = (runtime, *additional_runtimes)
+        identities = set()
+        for selected in self.runtimes:
+            model_id = getattr(selected, "model_id", None)
+            if (type(model_id) is not str or model_id not in MODEL_CANDIDATES
+                    or model_id in identities
+                    or (getattr(selected, "model_revision", None), getattr(selected, "mode", None))
+                    != MODEL_CANDIDATES[model_id]):
+                raise ProtocolError("INVALID_RUNTIME", "duplicate or invalid runtime selection")
+            identities.add(model_id)
+        self._active_model = None
         self.directory = private_directory(directory)
         self.path = directory / SOCKET_NAME
         self.stopping = threading.Event()
@@ -60,6 +73,15 @@ class Service:
         self._jobs: dict[str, threading.Event] = {}
         self._slots = threading.BoundedSemaphore(8)
         self._threads: list[threading.Thread] = []
+
+    def select_runtime(self, arguments):
+        for selected in self.runtimes:
+            if (arguments["mode"] == selected.mode
+                    and arguments["model_id"] in {"auto", selected.model_id}
+                    and not (selected.model_id == "qwen3-tts-0.6b-customvoice"
+                             and arguments.get("instruction"))):
+                return selected
+        raise ProtocolError("UNSUPPORTED_CAPABILITY", "no selected model supports this request")
 
     def stop(self) -> None:
         self.stopping.set()
@@ -153,6 +175,7 @@ class Service:
             if claimed:
                 with self._mutex:
                     self._jobs.pop(request.job_id, None)
+                    self._active_model = None
                     claimed = False
 
         try:
@@ -169,13 +192,13 @@ class Service:
                     raise ProtocolError("UNSUPPORTED_CAPABILITY", "language is not supported by this runtime")
                 if request.arguments["mode"] == "prompt_clone" and "instruction" in request.arguments:
                     raise ProtocolError("UNSUPPORTED_CAPABILITY", "clone runtime cannot apply instructions")
-                if self.runtime.model_id == "qwen3-tts-0.6b-customvoice" and request.arguments.get("instruction"):
-                    raise ProtocolError("UNSUPPORTED_CAPABILITY", "this named-voice model cannot apply instructions")
+                selected_runtime = self.select_runtime(request.arguments)
                 with self._mutex:
                     if self._jobs or self.stopping.is_set():
                         raise ProtocolError("BUSY", "speech worker is busy")
                     cancellation = threading.Event()
                     self._jobs[request.job_id] = cancellation
+                    self._active_model = selected_runtime.model_id
                     claimed = True
             snapshot = verify_request_descriptors(request, descriptors)
             for descriptor in descriptors:
@@ -185,13 +208,14 @@ class Service:
                 result = {"protocol_major": 1, "protocol_minor": 0}
                 kind = "hello"
             elif request.operation == "models":
-                result = {"models": [self.runtime.model_record()]}
+                result = {"models": [selected.model_record() for selected in self.runtimes]}
                 kind = "models"
             elif request.operation == "status":
                 with self._mutex:
                     busy = bool(self._jobs)
+                    model_id = self._active_model or self.runtime.model_id
                 result = {"provider_state": "busy" if busy else "ready", "worker_active": busy,
-                          "engine_id": "qwen3-tts", "model_id": self.runtime.model_id,
+                          "engine_id": "qwen3-tts", "model_id": model_id,
                           "release_qualified": False}
                 kind = "status"
             elif request.operation == "cancel":
@@ -212,7 +236,7 @@ class Service:
             else:
                 channel.settimeout(max(0.001, deadline - time.monotonic()))
                 send_packet(channel, _reply(request, "accepted", {}))
-                result, payload = run_job(self.runtime, snapshot, request.arguments,
+                result, payload = run_job(selected_runtime, snapshot, request.arguments,
                                  deadline=deadline, cancel=cancellation,
                                  disconnected=lambda: self.stopping.is_set() or _closed(channel))
                 # Canonical audio is returned in one read-only descriptor.

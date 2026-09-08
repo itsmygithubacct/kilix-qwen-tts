@@ -6,9 +6,10 @@ candidate for Kilix 0.2.2; release profiles and installer authority remain open.
 
 The pinned engine is Qwen3-TTS `6cafe5582caea83df269c36b1ce62d953a9cc66b`.
 The runtime recognises the exact 0.6B/1.7B Base and CustomVoice snapshots and
-the 1.7B VoiceDesign snapshot listed in `runtime.py`. Each installation exposes
-only its model's capability: consent-attested prompt cloning, named voices,
-or voice design. Real CPU development jobs cover 0.6B Base, 0.6B CustomVoice
+the 1.7B VoiceDesign snapshot listed in `runtime.py`. A service can select one
+installation or an installed-model index and route consent-attested prompt
+cloning, named voices and voice design to their matching models while retaining
+one worker slot. Real CPU development jobs cover 0.6B Base, 0.6B CustomVoice
 and 1.7B VoiceDesign. Other paths require their own real-model validation.
 No GPU or streaming profile is
 advertised. Missing installations and unsupported capabilities refuse.
@@ -159,3 +160,38 @@ without it, those optional tests report skips. Their synthetic packaged catalog
 fixtures exercise the production authority and storage implementation without
 admitting models to a release. Installed descriptors do not establish a
 qualified resource profile or full install-transaction authority.
+
+For all three modes on one endpoint, pass `serve --runtime-index INDEX.json
+--content-root /absolute/installed-content`. The index has this shape:
+
+```json
+{
+  "schema": "kilix.qwen-tts.runtime-set/v1",
+  "runtimes": [
+    {
+      "root": "/absolute/base-runtime",
+      "asset_id": "qwen3-tts-0.6b-base",
+      "snapshot_bytes": 3000000000
+    },
+    {
+      "root": "/absolute/named-runtime",
+      "asset_id": "qwen3-tts-0.6b-customvoice",
+      "snapshot_bytes": 3000000000
+    },
+    {
+      "root": "/absolute/design-runtime",
+      "asset_id": "qwen3-tts-1.7b-voicedesign",
+      "snapshot_bytes": 5000000000
+    }
+  ]
+}
+```
+
+The owned regular index is bounded to 64 KiB and five unique models. Every
+entry goes through the same packaged receipt binding. `auto` selects the first
+listed model supporting the requested mode and instruction; an explicit model
+must match exactly. The 0.6B CustomVoice model cannot apply style instructions.
+An unsupported request refuses, and never chooses a different mode. `models`
+lists the selected capabilities, while busy `status` names the active model.
+All modes share one worker slot and release it only after owned teardown.
+Models are loaded per job and are not retained idle between requests.
