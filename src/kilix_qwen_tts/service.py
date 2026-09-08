@@ -255,22 +255,39 @@ class Service:
                 result = {"loaded": False}
                 kind = "unloaded"
             else:
-                channel.settimeout(max(0.001, deadline - time.monotonic()))
-                send_packet(channel, _reply(request, "accepted", {}))
+                def send_job_packet(kind, result, descriptor=None):
+                    # SOCK_SEQPACKET sends one whole packet or no packet. A
+                    # socket timeout transferred neither the packet nor its
+                    # descriptor, so only that failure may be retried. Keep
+                    # owned teardown reachable when a peer stops reading.
+                    while True:
+                        if cancellation.is_set() or self.stopping.is_set() or _closed(channel):
+                            raise ProtocolError("CANCELED", "job canceled")
+                        remaining = deadline - time.monotonic()
+                        if remaining <= 0:
+                            raise ProtocolError("DEADLINE_EXCEEDED", "job deadline exceeded")
+                        channel.settimeout(min(0.05, remaining))
+                        try:
+                            send_packet(channel, _reply(request, kind, result), descriptor)
+                            return
+                        except ProtocolError as error:
+                            if (error.code != "TRANSPORT_ERROR"
+                                    or not isinstance(error.__cause__, TimeoutError)):
+                                raise
+
+                send_job_packet("accepted", {})
                 def queued(status):
-                    channel.settimeout(max(0.001, deadline - time.monotonic()))
-                    send_packet(channel, _reply(request, "queued", {
+                    send_job_packet("queued", {
                         "state": status.state, "position": status.position,
-                        "lease_version": status.version}))
+                        "lease_version": status.version})
                 def chunk(sequence, frame_offset, pcm):
                     from .streaming import chunk_metadata
-                    channel.settimeout(max(0.001, deadline - time.monotonic()))
                     with tempfile.TemporaryFile() as writer:
                         writer.write(pcm)
                         writer.flush()
                         descriptor = os.open(f"/proc/self/fd/{writer.fileno()}", os.O_RDONLY | os.O_CLOEXEC)
                         try:
-                            send_packet(channel, _reply(request, "chunk", chunk_metadata(sequence, frame_offset, pcm)), descriptor)
+                            send_job_packet("chunk", chunk_metadata(sequence, frame_offset, pcm), descriptor)
                         finally:
                             os.close(descriptor)
                 stream_options = {"on_chunk": chunk} if streaming else {}
@@ -301,7 +318,7 @@ class Service:
                     try:
                         metadata = result
                         finish_job()
-                        send_packet(channel, _reply(request, "result", metadata), result_fd)
+                        send_job_packet("result", metadata, result_fd)
                     finally:
                         os.close(result_fd)
                 return
