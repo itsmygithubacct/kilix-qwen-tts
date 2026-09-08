@@ -50,8 +50,10 @@ def _reply(request: ProviderRequest, kind: str, result: dict) -> dict:
 
 
 class Service:
-    def __init__(self, runtime: InstalledRuntime, directory: Path, *, additional_runtimes=()):
+    def __init__(self, runtime: InstalledRuntime, directory: Path, *, additional_runtimes=(), execution_policy=None):
         self.runtime = runtime
+        self.execution_policy = execution_policy
+        self._unavailable = False
         if type(additional_runtimes) not in (tuple, list) or len(additional_runtimes) > 4:
             raise ProtocolError("INVALID_RUNTIME", "runtime selection exceeds its bound")
         self.runtimes = (runtime, *additional_runtimes)
@@ -194,6 +196,8 @@ class Service:
                     raise ProtocolError("UNSUPPORTED_CAPABILITY", "clone runtime cannot apply instructions")
                 selected_runtime = self.select_runtime(request.arguments)
                 with self._mutex:
+                    if self._unavailable:
+                        raise ProtocolError("SUPERVISOR_FAILED", "owned cleanup remains unproven")
                     if self._jobs or self.stopping.is_set():
                         raise ProtocolError("BUSY", "speech worker is busy")
                     cancellation = threading.Event()
@@ -213,8 +217,9 @@ class Service:
             elif request.operation == "status":
                 with self._mutex:
                     busy = bool(self._jobs)
+                    unavailable = self._unavailable
                     model_id = self._active_model or self.runtime.model_id
-                result = {"provider_state": "busy" if busy else "ready", "worker_active": busy,
+                result = {"provider_state": "unavailable" if unavailable else "busy" if busy else "ready", "worker_active": busy,
                           "engine_id": "qwen3-tts", "model_id": model_id,
                           "release_qualified": False}
                 kind = "status"
@@ -229,6 +234,8 @@ class Service:
                 kind = "canceled"
             elif request.operation == "unload":
                 with self._mutex:
+                    if self._unavailable:
+                        raise ProtocolError("SUPERVISOR_FAILED", "owned cleanup remains unproven")
                     if self._jobs:
                         raise ProtocolError("BUSY", "cannot unload during a job")
                 result = {"loaded": False}
@@ -236,8 +243,14 @@ class Service:
             else:
                 channel.settimeout(max(0.001, deadline - time.monotonic()))
                 send_packet(channel, _reply(request, "accepted", {}))
+                def queued(status):
+                    channel.settimeout(max(0.001, deadline - time.monotonic()))
+                    send_packet(channel, _reply(request, "queued", {
+                        "state": status.state, "position": status.position,
+                        "lease_version": status.version}))
                 result, payload = run_job(selected_runtime, snapshot, request.arguments,
                                  deadline=deadline, cancel=cancellation,
+                                 execution_policy=self.execution_policy, job_id=request.job_id, progress=queued,
                                  disconnected=lambda: self.stopping.is_set() or _closed(channel))
                 # Canonical audio is returned in one read-only descriptor.
                 with tempfile.TemporaryFile() as writer:
@@ -253,6 +266,9 @@ class Service:
                 return
             send_packet(channel, _reply(request, kind, result))
         except (ProtocolError, OSError, ValueError, KeyError) as error:
+            if isinstance(error, ProtocolError) and error.code == "SUPERVISOR_FAILED":
+                with self._mutex:
+                    self._unavailable = True
             finish_job()
             if request is not None:
                 code = error.code if isinstance(error, ProtocolError) else "PROVIDER_ERROR"

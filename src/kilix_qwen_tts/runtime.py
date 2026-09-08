@@ -193,12 +193,22 @@ def stop_process(process: subprocess.Popen) -> None:
 
 def run_job(runtime: InstalledRuntime, audio_fd: int | None, args: dict, *,
             deadline: float, cancel: threading.Event,
-            disconnected: Callable[[], bool] = lambda: False) -> tuple[dict, bytes]:
+            disconnected: Callable[[], bool] = lambda: False,
+            execution_policy=None, job_id=None, progress=None) -> tuple[dict, bytes]:
+    from .owned import OwnedExecution
+    with OwnedExecution(execution_policy, job_id=job_id, workload="tts-utterance", deadline=deadline,
+                        cancelled=cancel.is_set, disconnected=disconnected, progress=progress) as owner:
+        return _run_owned_job(runtime, audio_fd, args, deadline=deadline, cancel=cancel,
+                              disconnected=disconnected, owner=owner)
+
+
+def _run_owned_job(runtime, audio_fd, args, *, deadline, cancel, disconnected, owner):
     if cancel.is_set() or disconnected():
         raise ProtocolError("CANCELED", "job canceled")
     if time.monotonic() >= deadline:
         raise ProtocolError("DEADLINE_EXCEEDED", "job deadline exceeded")
     def check():
+        owner.check()
         if cancel.is_set() or disconnected():
             raise ProtocolError("CANCELED", "job canceled")
         if time.monotonic() >= deadline:
@@ -220,7 +230,7 @@ def run_job(runtime: InstalledRuntime, audio_fd: int | None, args: dict, *,
     with tempfile.TemporaryDirectory(prefix="kilix-qwen-job-") as workspace, tempfile.TemporaryFile() as output, launch(runtime, workspace, audio_fd, check) as (command, descriptors):
         job = {"runtime": "/opt/runtime", "manifest": runtime.manifest,
                "audio_fd": None, "args": args, "workspace": "/job"}
-        process = subprocess.Popen(
+        process = owner.spawn(
             command, stdin=subprocess.PIPE,
             stdout=output, stderr=subprocess.DEVNULL, env=environment,
             pass_fds=descriptors, start_new_session=True,
@@ -232,6 +242,7 @@ def run_job(runtime: InstalledRuntime, audio_fd: int | None, args: dict, *,
             process.stdin.write(json.dumps(job, separators=(",", ":")).encode())
             process.stdin.close()
             while process.poll() is None:
+                owner.check()
                 if cancel.is_set() or disconnected():
                     raise ProtocolError("CANCELED", "job canceled")
                 if time.monotonic() >= deadline:
@@ -286,4 +297,4 @@ def run_job(runtime: InstalledRuntime, audio_fd: int | None, args: dict, *,
                 raise ProtocolError("MALFORMED_WORKER_RESULT", "invalid synthesized WAV") from error
             return result, payload
         finally:
-            stop_process(process)
+            owner.finish(process, stop_process)

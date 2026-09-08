@@ -7,11 +7,13 @@ import json
 import os
 from pathlib import Path
 import signal
+import socket
 import subprocess
 import sys
 import time
 
 stopping = False
+CLEANUP_MARKER = b"KILIX_REAPED_V1"
 
 
 def stop(_signal, _frame):
@@ -42,6 +44,24 @@ def reap_descendants():
 
 
 def main():
+    completion = None
+    if len(sys.argv) >= 3 and sys.argv[-2] == "--completion-fd":
+        completion_fd = int(sys.argv[-1])
+        if completion_fd < 3:
+            return 125
+        completion = socket.socket(fileno=completion_fd)
+        if completion.getsockopt(socket.SOL_SOCKET, socket.SO_TYPE) != socket.SOCK_SEQPACKET:
+            return 125
+        os.set_inheritable(completion_fd, False)
+        del sys.argv[-2:]
+    guard_fd = None
+    if len(sys.argv) >= 3 and sys.argv[-2] == "--guard-fd":
+        guard_fd = int(sys.argv[-1])
+        if guard_fd < 3 or (completion is not None and guard_fd == completion.fileno()):
+            return 125
+        os.fstat(guard_fd)
+        os.set_inheritable(guard_fd, False)
+        del sys.argv[-2:]
     parent = os.getppid()
     for sig in (signal.SIGTERM, signal.SIGINT):
         signal.signal(sig, stop)
@@ -75,6 +95,12 @@ def main():
         command = [sys.executable, "-I", "-B", str(Path(__file__).with_name("worker.py"))]
     else:
         return 125
+    if guard_fd is not None:
+        descriptors.append(guard_fd)
+        if command[0] == "/usr/bin/bwrap":
+            # Bubblewrap retains this same open description until its sandbox
+            # exits. The trusted supervisor also keeps its own inherited copy.
+            command = [command[0], "--sync-fd", str(guard_fd), *command[1:]]
     worker = subprocess.Popen(
         command,
         stdin=subprocess.PIPE, stdout=sys.stdout.buffer, stderr=sys.stderr,
@@ -82,7 +108,8 @@ def main():
     )
     try:
         for descriptor in descriptors:
-            os.close(descriptor)
+            if descriptor != guard_fd:
+                os.close(descriptor)
         assert worker.stdin is not None
         worker.stdin.write(payload)
         worker.stdin.close()
@@ -91,6 +118,15 @@ def main():
         return 130 if stopping else worker.returncode
     finally:
         reap_descendants()
+        if completion is not None:
+            # Only this trusted supervisor emits the kernel-credentialed
+            # cleanup message; the engine never inherits this descriptor.
+            try:
+                completion.send(CLEANUP_MARKER)
+            except OSError:
+                pass
+            finally:
+                completion.close()
 
 
 if __name__ == "__main__":

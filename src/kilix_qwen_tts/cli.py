@@ -31,6 +31,8 @@ def parser():
             sub.add_argument("--installed-asset")
             sub.add_argument("--content-root", type=Path)
             sub.add_argument("--model-snapshot-bytes", type=int)
+            sub.add_argument("--lease-device")
+            sub.add_argument("--lease-namespace")
         elif command == "synthesize":
             sub.add_argument("--output", type=Path)
             mode = sub.add_mutually_exclusive_group()
@@ -74,13 +76,17 @@ def main(argv=None):
     try:
         from .runtime import InstalledRuntime
         from .service import Service, client_request, request_value, runtime_directory
+        if args.command == "serve":
+            from .owned import from_options as execution_options
+            execution_policy = execution_options(args)
         if args.command == "serve" and args.runtime_index is not None:
             if (args.content_root is None or args.installed_asset is not None
                     or args.model_snapshot_bytes is not None):
                 raise ProtocolError("INVALID_REQUEST", "runtime index requires only the shared content root")
             from .selection import installed_runtimes
             with installed_runtimes(args.runtime_index, args.content_root) as runtimes:
-                service = Service(runtimes[0], runtime_directory(), additional_runtimes=runtimes[1:])
+                service = Service(runtimes[0], runtime_directory(), additional_runtimes=runtimes[1:],
+                                  execution_policy=execution_policy)
                 for sig in (signal.SIGINT, signal.SIGTERM):
                     signal.signal(sig, lambda _sig, _frame: service.stop())
                 service.serve()
@@ -91,7 +97,8 @@ def main(argv=None):
                                         consumer_schema="kilix.qwen-tts.runtime")
         if args.command == "serve" and args.runtime_root is not None:
             with model_source if model_source is not None else nullcontext():
-                service = Service(InstalledRuntime(args.runtime_root, model_source=model_source), runtime_directory())
+                service = Service(InstalledRuntime(args.runtime_root, model_source=model_source), runtime_directory(),
+                                  execution_policy=execution_policy)
                 for sig in (signal.SIGINT, signal.SIGTERM):
                     signal.signal(sig, lambda _sig, _frame: service.stop())
                 service.serve()
