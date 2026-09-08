@@ -331,33 +331,83 @@ def request_value(operation: str, *, job_id: str | None = None,
     return value
 
 
-def client_request(directory: Path, value: dict, descriptor: int | None = None, *, on_chunk=None) -> dict:
+def client_request(directory: Path, value: dict, descriptor: int | None = None, *, on_chunk=None, cancelled=None) -> dict:
     from .streaming import ClientStream, MAX_RECORDS, requested
     ProviderRequest.from_payload(value)
+    if cancelled is not None and (not callable(cancelled) or value["op"] != "submit"):
+        raise ProtocolError("INVALID_REQUEST", "cancellation callback requires a submit request")
+
+    def cancellation_requested():
+        if cancelled is None:
+            return False
+        decision = cancelled()
+        if type(decision) is not bool:
+            raise ProtocolError("INVALID_REQUEST", "cancellation callback must return boolean")
+        return decision
+
+    if cancellation_requested():
+        raise ProtocolError("CANCELED", "job canceled before submission")
     streaming = requested(value)
     if streaming and value["args"]["output"] != {"sample_format": "s16le", "sample_rate_hz": 24000, "channels": 1}:
         raise ProtocolError("UNSUPPORTED_CAPABILITY", "PCM streaming requires 24 kHz mono PCM16")
     if on_chunk is not None and (not streaming or not callable(on_chunk)):
         raise ProtocolError("INVALID_REQUEST", "invalid PCM stream consumer")
-    stream = ClientStream(value["args"]["max_duration_ms"], on_chunk) if streaming else None
+    def deliver_chunk(*row):
+        if not cancellation_requested() and on_chunk is not None:
+            on_chunk(*row)
+
+    stream = ClientStream(value["args"]["max_duration_ms"], deliver_chunk) if streaming else None
     private_directory(directory)
     path = directory / SOCKET_NAME
     info = path.lstat()
     if not stat.S_ISSOCK(info.st_mode) or info.st_uid != os.geteuid() or info.st_mode & 0o177:
         raise ProtocolError("UNAUTHORIZED_PEER", "unsafe provider endpoint")
-    # The job deadline stops execution. Allow bounded supervisor teardown and
-    # the terminal error to arrive before treating the transport as failed.
-    deadline = time.monotonic() + value["deadline_ms"] / 1000 + 6
+    # Legacy submit callers allow bounded post-deadline supervisor teardown.
+    # Controlled calls and short control requests retain their stated timeout.
+    grace = 6 if cancelled is None and value["op"] == "submit" else 0
+    deadline = time.monotonic() + value["deadline_ms"] / 1000 + grace
     with socket.socket(socket.AF_UNIX, socket.SOCK_SEQPACKET) as channel:
-        channel.settimeout(max(0.001, deadline - time.monotonic()))
-        channel.connect(str(path))
+        remaining = max(0.001, deadline - time.monotonic())
+        channel.settimeout(min(0.2, remaining) if cancelled is not None else remaining)
+        try:
+            channel.connect(str(path))
+        except OSError as error:
+            if cancellation_requested():
+                raise ProtocolError("CANCELED", "job canceled before submission") from error
+            raise ProtocolError("TRANSPORT_ERROR", "provider connection failed") from error
         require_same_uid_peer(channel)
+        if cancellation_requested():
+            raise ProtocolError("CANCELED", "job canceled before submission")
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise ProtocolError("DEADLINE_EXCEEDED", "provider deadline exceeded before submission")
+        channel.settimeout(min(0.2, remaining) if cancelled is not None else remaining)
         send_packet(channel, value, descriptor)
         progress_count = 0
         for _ in range(MAX_RECORDS + 256 if streaming else 256):
             remaining = deadline - time.monotonic()
             if remaining <= 0:
                 raise ProtocolError("DEADLINE_EXCEEDED", "provider deadline exceeded")
+            if cancelled is not None:
+                while True:
+                    if cancellation_requested():
+                        remaining = deadline - time.monotonic()
+                        if remaining < 0.001:
+                            raise ProtocolError("DEADLINE_EXCEEDED", "provider cancellation deadline exceeded")
+                        try:
+                            client_request(directory, request_value("cancel", job_id=value["job_id"],
+                                           timeout=min(0.2, remaining)))
+                        except (ProtocolError, OSError):
+                            pass
+                        # Return closes our original channel and descriptors.
+                        # Neither local cancellation nor an ACK proves that
+                        # the provider has finished its authenticated teardown.
+                        raise ProtocolError("CANCELED", "client canceled; provider cleanup pending")
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        raise ProtocolError("DEADLINE_EXCEEDED", "provider cancellation deadline exceeded")
+                    if select.select([channel], [], [], min(0.05, remaining))[0]:
+                        break
             channel.settimeout(remaining)
             event, descriptors = receive_packet(channel)
             try:
@@ -415,6 +465,8 @@ def client_request(directory: Path, value: dict, descriptor: int | None = None, 
                     validate_result(result, value["args"], payload)
                     if stream is not None:
                         stream.require_audio(payload)
+                    if cancellation_requested():
+                        raise ProtocolError("CANCELED", "job canceled before delivery")
                     return result, payload
                 if descriptors or event.get("type") not in {"hello", "status", "models", "unloaded", "canceled"}:
                     raise ProtocolError("INVALID_RESPONSE", "unexpected provider response")

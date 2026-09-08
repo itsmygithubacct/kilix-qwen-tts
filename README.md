@@ -273,3 +273,13 @@ generation; that duplicate work has not been optimized away. The first real
 0.6B named-voice CPU development run delivered five chunks, with the first at
 71.774 seconds and completion at 149.748 seconds on a shared host. These are
 observations from one draft run, not latency or memory qualification.
+
+
+The Python client accepts `client_request(..., cancelled=callback)` for submit
+operations. The callback must promptly return a boolean. Controlled calls keep
+the requested deadline and observe cancellation during receive waits. On
+cancellation the client attempts a short cancel request for that submitted job,
+closes its own channel and descriptors, and raises `CANCELED`. This is local
+cancellation: neither it nor a cancel ACK proves provider cleanup. Check provider
+status before a successor job; busy or unavailable remains authoritative. No
+background request thread is retained. Borrowed input descriptors stay open.
