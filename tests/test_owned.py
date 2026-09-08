@@ -31,7 +31,9 @@ if mode == 'forged':
         raise SystemExit(0)
 if mode != 'missing':
     sock.send(b'KILIX_REAPED_V1' if mode != 'wrong' else b'NOT_REAPED')
-if mode == 'extra':
+if mode in ('empty-tail', 'empty-extra'):
+    sock.send(b'')
+if mode in ('extra', 'empty-extra'):
     sock.send(b'x')
 sock.close()
 if mode == 'forged':
@@ -62,7 +64,7 @@ class OwnedCleanupTests(unittest.TestCase):
                 process.wait(timeout=5)
 
     def test_only_exact_supervisor_credentials_and_one_marker_prove_cleanup(self):
-        for mode in ('success', 'missing', 'wrong', 'extra', 'forged'):
+        for mode in ('success', 'missing', 'wrong', 'extra', 'forged', 'empty-tail', 'empty-extra'):
             with self.subTest(mode=mode):
                 before = len(os.listdir('/proc/self/fd'))
                 with self.owner() as owner:

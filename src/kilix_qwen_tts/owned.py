@@ -97,8 +97,13 @@ class OwnedExecution:
                          and len(ancillary) == len(credentials) == 1
                          and len(credentials[0][2]) == _CREDENTIALS.size
                          and _CREDENTIALS.unpack(credentials[0][2]) == (process.pid, os.geteuid(), os.getegid()))
-                if valid and self.parent.recv(1, socket.MSG_DONTWAIT):
-                    valid = False
+                if valid:
+                    trailing, extra_control, extra_flags, _address = self.parent.recvmsg(
+                        1, socket.CMSG_SPACE(_CREDENTIALS.size), socket.MSG_DONTWAIT)
+                    # An empty seqpacket record still has sender credentials;
+                    # only an empty payload/control/flags tuple proves EOF.
+                    if trailing or extra_control or extra_flags:
+                        valid = False
             except (OSError, ValueError):
                 valid = False
             self.cleanup_complete = valid
