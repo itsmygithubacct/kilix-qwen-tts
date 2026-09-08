@@ -35,6 +35,8 @@ def parser():
             sub.add_argument("--lease-namespace")
         elif command == "synthesize":
             sub.add_argument("--output", type=Path)
+            sub.add_argument("--stream-pcm", action="store_true",
+                             help="write incremental 24 kHz mono PCM16 to stdout; final metadata goes to stderr")
             mode = sub.add_mutually_exclusive_group()
             mode.add_argument("--prompt", type=Path)
             mode.add_argument("--description-file", type=Path)
@@ -103,7 +105,7 @@ def main(argv=None):
                     signal.signal(sig, lambda _sig, _frame: service.stop())
                 service.serve()
             return 0
-        if args.command == "synthesize" and args.output is not None:
+        if args.command == "synthesize" and (args.output is not None or args.stream_pcm):
             text = sys.stdin.buffer.read(16_385).decode("utf-8")
             request = {"task": "synthesize", "text": text, "model_id": "auto",
                        "language": args.language, "seed": args.seed,
@@ -134,20 +136,26 @@ def main(argv=None):
                             request["description"] = description.read(4097).decode("utf-8")
                     else:
                         request["voice_id"] = args.voice_id
+                    def consume(_sequence, _frame_offset, pcm):
+                        sys.stdout.buffer.write(pcm)
+                        sys.stdout.buffer.flush()
                     result, audio = client_request(runtime_directory(), request_value(
-                        "submit", job_id=uuid.uuid4().hex, args=request, timeout=args.timeout), descriptor)
+                        "submit", job_id=uuid.uuid4().hex, args=request, timeout=args.timeout,
+                        stream=args.stream_pcm), descriptor, on_chunk=consume if args.stream_pcm else None)
                 finally:
                     if descriptor is not None:
                         os.close(descriptor)
             # CLI destinations are local user operations and never go on wire.
-            descriptor = os.open(args.output, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_CLOEXEC, 0o600)
-            try:
-                with os.fdopen(descriptor, "wb") as destination:
-                    destination.write(audio)
-            except BaseException:
-                args.output.unlink(missing_ok=True)
-                raise
-            print(json.dumps(result, separators=(",", ":"), sort_keys=True))
+            if args.output is not None:
+                descriptor = os.open(args.output, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_CLOEXEC, 0o600)
+                try:
+                    with os.fdopen(descriptor, "wb") as destination:
+                        destination.write(audio)
+                except BaseException:
+                    args.output.unlink(missing_ok=True)
+                    raise
+            print(json.dumps(result, separators=(",", ":"), sort_keys=True),
+                  file=sys.stderr if args.stream_pcm else sys.stdout)
             return 0
         if args.command in {"models", "status", "cancel", "unload"}:
             try:

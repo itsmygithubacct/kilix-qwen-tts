@@ -30,6 +30,14 @@ def main() -> None:
     resource.setrlimit(resource.RLIMIT_NOFILE, (128, 128))
     os.umask(0o077)
     request = json.loads(sys.stdin.buffer.read(65_537))
+    streaming = request.get("streaming_pcm", False)
+    if type(streaming) is not bool:
+        raise ValueError("invalid streaming selection")
+    stream = None
+    incremental = None
+    if streaming:
+        from kilix_qwen_tts.streaming import WorkerStream
+        stream = WorkerStream(sys.stdout.buffer)
     args = request["args"]
     root = Path(request["runtime"])
     manifest = request["manifest"]
@@ -44,8 +52,8 @@ def main() -> None:
     import torch
     # Third-party imports/model generation may print status to stdout. The
     # worker reserves stdout for one bounded machine-readable result.
-    from contextlib import redirect_stdout
-    with redirect_stdout(sys.stderr):
+    from contextlib import ExitStack, redirect_stdout
+    with ExitStack() as resources, redirect_stdout(sys.stderr):
         from qwen_tts import Qwen3TTSModel
         torch.set_num_threads(2)
         torch.set_num_interop_threads(2)
@@ -55,6 +63,9 @@ def main() -> None:
             attn_implementation="sdpa", local_files_only=True,
             use_safetensors=True, trust_remote_code=False,
         )
+        if stream is not None:
+            from kilix_qwen_tts.codec_stream import IncrementalCodes
+            incremental = resources.enter_context(IncrementalCodes(model, stream.pcm, args["max_duration_ms"]))
         language = LANGUAGES[args["language"].lower().split("-")[0]]
         options = {"text": args["text"], "language": language,
                    "non_streaming_mode": True,
@@ -106,7 +117,11 @@ def main() -> None:
     if not duration_ms:
         raise ValueError("empty engine audio")
     destination = workspace / "output.wav"
-    sf.write(destination, audio, sample_rate, format="WAV", subtype="PCM_16")
+    if incremental is not None:
+        from kilix_qwen_tts.streaming import wave_from_pcm
+        destination.write_bytes(wave_from_pcm(incremental.finish(len(audio))))
+    else:
+        sf.write(destination, audio, sample_rate, format="WAV", subtype="PCM_16")
     payload = destination.read_bytes()
     result = {"engine_id": "qwen3-tts", "engine_revision": ENGINE_COMMIT,
               "model_id": manifest["model"]["id"], "model_revision": manifest["model"]["revision"],
@@ -114,7 +129,10 @@ def main() -> None:
               "audio": {"sha256": hashlib.sha256(payload).hexdigest(), "byte_length": len(payload)}}
     if conditioning is not None:
         result["conditioning"] = conditioning
-    sys.stdout.write(json.dumps(result, allow_nan=False, separators=(",", ":")))
+    if stream is not None:
+        stream.finish(result)
+    else:
+        sys.stdout.write(json.dumps(result, allow_nan=False, separators=(",", ":")))
 
 
 if __name__ == "__main__":

@@ -185,6 +185,8 @@ class Service:
             require_same_uid_peer(channel)
             value, descriptors = receive_packet(channel)
             request = ProviderRequest.from_payload(value)
+            from .streaming import requested
+            streaming = requested(value)
             deadline = started + request.deadline_ms / 1000
             if request.operation == "submit":
                 if request.arguments.get("prompt_audio", {}).get("byte_length", 0) > MAX_INPUT_BYTES:
@@ -248,10 +250,22 @@ class Service:
                     send_packet(channel, _reply(request, "queued", {
                         "state": status.state, "position": status.position,
                         "lease_version": status.version}))
+                def chunk(sequence, frame_offset, pcm):
+                    from .streaming import chunk_metadata
+                    channel.settimeout(max(0.001, deadline - time.monotonic()))
+                    with tempfile.TemporaryFile() as writer:
+                        writer.write(pcm)
+                        writer.flush()
+                        descriptor = os.open(f"/proc/self/fd/{writer.fileno()}", os.O_RDONLY | os.O_CLOEXEC)
+                        try:
+                            send_packet(channel, _reply(request, "chunk", chunk_metadata(sequence, frame_offset, pcm)), descriptor)
+                        finally:
+                            os.close(descriptor)
+                stream_options = {"on_chunk": chunk} if streaming else {}
                 result, payload = run_job(selected_runtime, snapshot, request.arguments,
                                  deadline=deadline, cancel=cancellation,
                                  execution_policy=self.execution_policy, job_id=request.job_id, progress=queued,
-                                 disconnected=lambda: self.stopping.is_set() or _closed(channel))
+                                 disconnected=lambda: self.stopping.is_set() or _closed(channel), **stream_options)
                 # Canonical audio is returned in one read-only descriptor.
                 with tempfile.TemporaryFile() as writer:
                     writer.write(payload)
@@ -287,16 +301,28 @@ class Service:
 
 
 def request_value(operation: str, *, job_id: str | None = None,
-                  args: dict | None = None, timeout: float = 300) -> dict:
+                  args: dict | None = None, timeout: float = 300, stream: bool = False) -> dict:
+    if type(stream) is not bool or (stream and operation != "submit"):
+        raise ProtocolError("INVALID_REQUEST", "invalid PCM stream selection")
     value = {"schema": PROTOCOL_SCHEMA, "type": "request", "request_id": uuid.uuid4().hex,
              "op": operation, "deadline_ms": int(timeout * 1000), "args": args or {}}
     if job_id is not None:
         value["job_id"] = job_id
+    if stream:
+        value["extensions"] = {"x_pcm_stream_v1": True}
     ProviderRequest.from_payload(value)
     return value
 
 
-def client_request(directory: Path, value: dict, descriptor: int | None = None) -> dict:
+def client_request(directory: Path, value: dict, descriptor: int | None = None, *, on_chunk=None) -> dict:
+    from .streaming import ClientStream, MAX_RECORDS, requested
+    ProviderRequest.from_payload(value)
+    streaming = requested(value)
+    if streaming and value["args"]["output"] != {"sample_format": "s16le", "sample_rate_hz": 24000, "channels": 1}:
+        raise ProtocolError("UNSUPPORTED_CAPABILITY", "PCM streaming requires 24 kHz mono PCM16")
+    if on_chunk is not None and (not streaming or not callable(on_chunk)):
+        raise ProtocolError("INVALID_REQUEST", "invalid PCM stream consumer")
+    stream = ClientStream(value["args"]["max_duration_ms"], on_chunk) if streaming else None
     private_directory(directory)
     path = directory / SOCKET_NAME
     info = path.lstat()
@@ -310,7 +336,8 @@ def client_request(directory: Path, value: dict, descriptor: int | None = None) 
         channel.connect(str(path))
         require_same_uid_peer(channel)
         send_packet(channel, value, descriptor)
-        for _ in range(256):
+        progress_count = 0
+        for _ in range(MAX_RECORDS + 256 if streaming else 256):
             remaining = deadline - time.monotonic()
             if remaining <= 0:
                 raise ProtocolError("DEADLINE_EXCEEDED", "provider deadline exceeded")
@@ -333,8 +360,16 @@ def client_request(directory: Path, value: dict, descriptor: int | None = None) 
                         code = "PROVIDER_ERROR"
                     raise ProtocolError(code, "provider refused the request")
                 if event.get("type") in {"accepted", "queued", "loading", "progress"}:
+                    progress_count += 1
+                    if progress_count > 255:
+                        raise ProtocolError("LIMIT_EXCEEDED", "too many provider progress events")
                     if descriptors or value["op"] != "submit":
                         raise ProtocolError("DESCRIPTOR_MISMATCH", "unexpected progress descriptor")
+                    continue
+                if event.get("type") == "chunk":
+                    if stream is None:
+                        raise ProtocolError("INVALID_RESPONSE", "unexpected PCM stream")
+                    stream.append(event.get("result"), descriptors)
                     continue
                 expected = {"hello": "hello", "models": "models", "status": "status",
                             "cancel": "canceled", "unload": "unloaded", "submit": "result"}
@@ -361,6 +396,8 @@ def client_request(directory: Path, value: dict, descriptor: int | None = None) 
                         raise ProtocolError("DESCRIPTOR_MISMATCH", "audio digest mismatch")
                     from .results import validate_result
                     validate_result(result, value["args"], payload)
+                    if stream is not None:
+                        stream.require_audio(payload)
                     return result, payload
                 if descriptors or event.get("type") not in {"hello", "status", "models", "unloaded", "canceled"}:
                     raise ProtocolError("INVALID_RESPONSE", "unexpected provider response")

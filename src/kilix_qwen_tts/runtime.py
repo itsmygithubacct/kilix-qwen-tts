@@ -176,7 +176,7 @@ class InstalledRuntime:
         return {"id": self.model_id, "revision": self.model_revision,
                 "engine_id": "qwen3-tts", "engine_revision": ENGINE_COMMIT,
                 "installed": True, "release_qualified": False, "device": "cpu",
-                "capabilities": [self.mode], "streaming": False}
+                "capabilities": [self.mode], "streaming": True}
 
 
 def stop_process(process: subprocess.Popen) -> None:
@@ -194,15 +194,15 @@ def stop_process(process: subprocess.Popen) -> None:
 def run_job(runtime: InstalledRuntime, audio_fd: int | None, args: dict, *,
             deadline: float, cancel: threading.Event,
             disconnected: Callable[[], bool] = lambda: False,
-            execution_policy=None, job_id=None, progress=None) -> tuple[dict, bytes]:
+            execution_policy=None, job_id=None, progress=None, on_chunk=None) -> tuple[dict, bytes]:
     from .owned import OwnedExecution
     with OwnedExecution(execution_policy, job_id=job_id, workload="tts-utterance", deadline=deadline,
                         cancelled=cancel.is_set, disconnected=disconnected, progress=progress) as owner:
         return _run_owned_job(runtime, audio_fd, args, deadline=deadline, cancel=cancel,
-                              disconnected=disconnected, owner=owner)
+                              disconnected=disconnected, owner=owner, on_chunk=on_chunk)
 
 
-def _run_owned_job(runtime, audio_fd, args, *, deadline, cancel, disconnected, owner):
+def _run_owned_job(runtime, audio_fd, args, *, deadline, cancel, disconnected, owner, on_chunk=None):
     if cancel.is_set() or disconnected():
         raise ProtocolError("CANCELED", "job canceled")
     if time.monotonic() >= deadline:
@@ -230,6 +230,13 @@ def _run_owned_job(runtime, audio_fd, args, *, deadline, cancel, disconnected, o
     with tempfile.TemporaryDirectory(prefix="kilix-qwen-job-") as workspace, tempfile.TemporaryFile() as output, launch(runtime, workspace, audio_fd, check) as (command, descriptors):
         job = {"runtime": "/opt/runtime", "manifest": runtime.manifest,
                "audio_fd": None, "args": args, "workspace": "/job"}
+        stream = None
+        if on_chunk is not None:
+            from .streaming import WorkerStreamReader
+            if not callable(on_chunk):
+                raise ProtocolError("INVALID_REQUEST", "invalid PCM consumer")
+            stream = WorkerStreamReader(output.fileno(), args["max_duration_ms"], on_chunk, check)
+            job["streaming_pcm"] = True
         process = owner.spawn(
             command, stdin=subprocess.PIPE,
             stdout=output, stderr=subprocess.DEVNULL, env=environment,
@@ -242,11 +249,9 @@ def _run_owned_job(runtime, audio_fd, args, *, deadline, cancel, disconnected, o
             process.stdin.write(json.dumps(job, separators=(",", ":")).encode())
             process.stdin.close()
             while process.poll() is None:
-                owner.check()
-                if cancel.is_set() or disconnected():
-                    raise ProtocolError("CANCELED", "job canceled")
-                if time.monotonic() >= deadline:
-                    raise ProtocolError("DEADLINE_EXCEEDED", "job deadline exceeded")
+                check()
+                if stream is not None:
+                    stream.drain()
                 cancel.wait(0.025)
             if cancel.is_set() or disconnected():
                 raise ProtocolError("CANCELED", "job canceled")
@@ -254,14 +259,18 @@ def _run_owned_job(runtime, audio_fd, args, *, deadline, cancel, disconnected, o
                 raise ProtocolError("DEADLINE_EXCEEDED", "job deadline exceeded")
             if process.returncode != 0:
                 raise ProtocolError("ENGINE_FAILED", "speech worker failed")
-            output.seek(0)
-            payload = output.read(MAX_RESULT_BYTES + 1)
-            if len(payload) > MAX_RESULT_BYTES:
-                raise ProtocolError("LIMIT_EXCEEDED", "transcript exceeds its bound")
-            try:
-                result = decode_payload(payload)
-            except (ProtocolError, ValueError, UnicodeDecodeError) as error:
-                raise ProtocolError("ENGINE_FAILED", "invalid worker result") from error
+            if stream is not None:
+                stream.drain(final=True)
+                result = stream.result
+            else:
+                output.seek(0)
+                payload = output.read(MAX_RESULT_BYTES + 1)
+                if len(payload) > MAX_RESULT_BYTES:
+                    raise ProtocolError("LIMIT_EXCEEDED", "transcript exceeds its bound")
+                try:
+                    result = decode_payload(payload)
+                except (ProtocolError, ValueError, UnicodeDecodeError) as error:
+                    raise ProtocolError("ENGINE_FAILED", "invalid worker result") from error
             required = {"engine_id", "engine_revision", "model_id", "model_revision", "duration_ms", "seed", "audio"}
             if args["mode"] == "prompt_clone":
                 required.add("conditioning")
@@ -295,6 +304,8 @@ def _run_owned_job(runtime, audio_fd, args, *, deadline, cancel, disconnected, o
                 validate_wave(payload, result["duration_ms"])
             except ProtocolError as error:
                 raise ProtocolError("MALFORMED_WORKER_RESULT", "invalid synthesized WAV") from error
+            if stream is not None:
+                stream.require_audio(payload)
             return result, payload
         finally:
             owner.finish(process, stop_process)

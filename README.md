@@ -11,8 +11,9 @@ installation or an installed-model index and route consent-attested prompt
 cloning, named voices and voice design to their matching models while retaining
 one worker slot. Real CPU development jobs cover 0.6B Base, 0.6B CustomVoice
 and 1.7B VoiceDesign. Other paths require their own real-model validation.
-No GPU or streaming profile is
-advertised. Missing installations and unsupported capabilities refuse.
+Optional incremental PCM delivery is available for the pinned CPU decoder.
+No GPU or measured streaming performance profile is qualified. Missing
+installations and unsupported capabilities refuse.
 
 ## Run
 
@@ -118,8 +119,8 @@ use an explicit fake engine; test counts do not establish neural quality.
 Voicebox supports the same candidate protocol and canonical WAV result.
 
 The interface candidate in `contracts/provider-interface-candidate-v1.json`
-also describes future streaming mechanics. That interface is not a claim that
-the present batch runtime implements streaming. Production asset admission,
+remains unchanged. The explicit PCM extension below adds a concrete incremental
+CPU path; it does not qualify the wider interface. Production asset admission,
 F106 selected resource profiles, shared accelerator admission, all-model and
 GPU measurements, perceptual review and the combined soak remain required.
 No model weights, environment binaries or user audio are committed here. The
@@ -233,3 +234,42 @@ state cannot establish persistent coordination across provider restarts. Shared
 lease, installed asset, hardware admission, microphone policy and release
 qualification are separate requirements; passing local controls supplies none
 of the unmeasured qualifications.
+
+
+## Incremental PCM delivery
+
+`kilix-qwen-tts synthesize --stream-pcm` writes headerless 24 kHz mono signed
+16-bit little-endian PCM to standard output as generation proceeds. It uses the
+same prompt, named-voice and design options as whole-result synthesis. The
+final metadata goes to standard error. Add `--output /absolute/new.wav` to
+commit a canonical WAV after successful completion. A failed or canceled
+stream can already have emitted partial PCM; consumers must treat the final
+result or error as authoritative and must not present partial output as a
+completed artifact. A broken output pipe disconnects and cancels the job.
+
+Python clients opt in with `request_value("submit", ..., stream=True)` and
+`client_request(..., on_chunk=callback)`. The callback receives
+`(sequence, frame_offset, pcm_bytes)` synchronously. The request carries
+`extensions.x_pcm_stream_v1: true`; ordinary requests keep whole-result
+delivery. Only 24 kHz mono PCM16 output is supported. Each `chunk` event has
+exact sequence/frame metadata, byte length and SHA256 with one read-only
+descriptor. Clients bound and copy the actual bytes before calling the
+consumer. The final validated WAV body must equal the concatenated chunks.
+Consumers should return promptly from callbacks; the original job deadline
+also applies to transport and backpressure.
+
+The worker observes complete 16-group code frames from the pinned 12 Hz
+talker and decodes every 20 frames (1.6 seconds of audio), retaining 25 code
+frames of left context. The last chunk can be shorter. Decoding preserves the
+talker's random state. Worker records are length bounded; incomplete writes
+never block the provider's cancellation/deadline checks. The final WAV uses
+the exact emitted PCM, and terminal readiness still follows owned cleanup.
+
+The rolling context can change samples compared with the whole-result
+decoder. A retained development comparison measured these differences, so
+streaming is not claimed to produce identical audio or to have passed listening
+review. The current upstream API also performs its final decode after code
+generation; that duplicate work has not been optimized away. The first real
+0.6B named-voice CPU development run delivered five chunks, with the first at
+71.774 seconds and completion at 149.748 seconds on a shared host. These are
+observations from one draft run, not latency or memory qualification.
