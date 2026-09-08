@@ -223,7 +223,12 @@ class ClientControlTests(unittest.TestCase):
                                             'job_id': cancel['job_id'], 'type': 'canceled', 'result': {'cancel_requested': True}})
                             else:
                                 assert control.recv(1) == b''
-                    assert original.recv(1) == b''
+                    try:
+                        assert original.recv(1) == b''
+                    except ConnectionResetError:
+                        # Cancellation may close before consuming accepted.
+                        # A closed seqpacket peer can then report reset, not EOF.
+                        pass
             except BaseException as error:
                 failures.append(error)
             finally:

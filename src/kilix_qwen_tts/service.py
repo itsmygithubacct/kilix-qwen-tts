@@ -354,6 +354,8 @@ def client_request(directory: Path, value: dict, descriptor: int | None = None, 
         raise ProtocolError("INVALID_REQUEST", "invalid PCM stream consumer")
     def deliver_chunk(*row):
         if not cancellation_requested() and on_chunk is not None:
+            if time.monotonic() >= deadline:
+                raise ProtocolError("DEADLINE_EXCEEDED", "provider deadline exceeded before delivery")
             on_chunk(*row)
 
     stream = ClientStream(value["args"]["max_duration_ms"], deliver_chunk) if streaming else None
@@ -467,9 +469,13 @@ def client_request(directory: Path, value: dict, descriptor: int | None = None, 
                         stream.require_audio(payload)
                     if cancellation_requested():
                         raise ProtocolError("CANCELED", "job canceled before delivery")
+                    if time.monotonic() >= deadline:
+                        raise ProtocolError("DEADLINE_EXCEEDED", "provider deadline exceeded before delivery")
                     return result, payload
                 if descriptors or event.get("type") not in {"hello", "status", "models", "unloaded", "canceled"}:
                     raise ProtocolError("INVALID_RESPONSE", "unexpected provider response")
+                if time.monotonic() >= deadline:
+                    raise ProtocolError("DEADLINE_EXCEEDED", "provider deadline exceeded before delivery")
                 return result
             finally:
                 for received in descriptors:

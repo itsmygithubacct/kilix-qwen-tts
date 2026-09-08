@@ -283,3 +283,7 @@ closes its own channel and descriptors, and raises `CANCELED`. This is local
 cancellation: neither it nor a cancel ACK proves provider cleanup. Check provider
 status before a successor job; busy or unavailable remains authoritative. No
 background request thread is retained. Borrowed input descriptors stay open.
+The client rechecks that deadline after validation, immediately before returning
+output or invoking the PCM consumer. Expired output is refused with
+`DEADLINE_EXCEEDED`. Legacy submit calls without a cancellation callback retain
+their existing six-second supervisor grace; short control calls receive no grace.
