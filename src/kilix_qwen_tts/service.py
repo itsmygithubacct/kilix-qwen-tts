@@ -55,6 +55,7 @@ class Service:
             raise ProtocolError("INVALID_REQUEST", "invalid prompt cache selection")
         from .prompt_cache import PromptCache
         self._prompt_cache = PromptCache() if prompt_cache else None
+        self._cache_generation = 0
         self.runtime = runtime
         self.execution_policy = execution_policy
         self._unavailable = False
@@ -91,9 +92,10 @@ class Service:
 
     def stop(self) -> None:
         self.stopping.set()
-        if self._prompt_cache is not None:
-            self._prompt_cache.clear()
         with self._mutex:
+            self._cache_generation += 1
+            if self._prompt_cache is not None:
+                self._prompt_cache.clear()
             for cancellation in self._jobs.values():
                 cancellation.set()
 
@@ -215,6 +217,7 @@ class Service:
                     cancellation = threading.Event()
                     self._jobs[request.job_id] = cancellation
                     self._active_model = selected_runtime.model_id
+                    cache_generation = self._cache_generation
                     claimed = True
             snapshot = verify_request_descriptors(request, descriptors)
             for descriptor in descriptors:
@@ -250,8 +253,9 @@ class Service:
                         raise ProtocolError("SUPERVISOR_FAILED", "owned cleanup remains unproven")
                     if self._jobs:
                         raise ProtocolError("BUSY", "cannot unload during a job")
-                if self._prompt_cache is not None:
-                    self._prompt_cache.clear()
+                    self._cache_generation += 1
+                    if self._prompt_cache is not None:
+                        self._prompt_cache.clear()
                 result = {"loaded": False}
                 kind = "unloaded"
             else:
@@ -306,10 +310,6 @@ class Service:
                 if cache_key is not None:
                     if len(produced_embeddings) != 1:
                         raise ProtocolError("MALFORMED_WORKER_RESULT", "missing speaker embedding")
-                    # run_job has validated the final audio and completed owned
-                    # teardown. A failed/canceled job can never populate cache.
-                    if not self.stopping.is_set():
-                        self._prompt_cache.put(cache_key, produced_embeddings[0])
                 # Canonical audio is returned in one read-only descriptor.
                 with tempfile.TemporaryFile() as writer:
                     writer.write(payload)
@@ -319,6 +319,17 @@ class Service:
                         metadata = result
                         finish_job()
                         send_job_packet("result", metadata, result_fd)
+                        if cache_key is not None:
+                            # A finished engine is not a successful terminal.
+                            # Never retain an embedding after terminal refusal,
+                            # or resurrect it after concurrent unload/stop.
+                            # No service/cache lock spans the transport wait.
+                            with self._mutex:
+                                if (cache_generation == self._cache_generation
+                                        and not self.stopping.is_set()
+                                        and not cancellation.is_set()
+                                        and time.monotonic() < deadline):
+                                    self._prompt_cache.put(cache_key, produced_embeddings[0])
                     finally:
                         os.close(result_fd)
                 return

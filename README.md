@@ -293,8 +293,11 @@ runtime byte checks. A new consent timestamp does not change the numerical
 embedding or permitted-use scope; that request's fresh consent digest remains
 bound to its own result. Text and seeds are not embedding inputs.
 
-Only a validated final result with proved owned cleanup can populate the
-cache. Cached input is included in the same sealed runtime bundle and is read
+Only a validated final result with proved owned cleanup and a successfully
+sent terminal packet can populate the cache. An unload or shutdown also
+invalidates pending insertions from older handlers. Cache publication can
+follow terminal delivery; an immediate next request may still miss. Cached
+input is included in the same sealed runtime bundle and is read
 only inside the private namespace. The worker accepts exactly 1,024 bounded
 finite float32 values in a fixed binary encoding, and never loads an arbitrary
 Python or pickle object. Prompt construction preserves the generation RNG.
