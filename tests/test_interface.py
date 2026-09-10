@@ -217,6 +217,16 @@ class InterfaceCandidateTests(unittest.TestCase):
         request["args"]["temperature"] = 0.7
         self.refusal(request, "INVALID_REQUEST")
 
+    def test_language_tag_cannot_be_unbounded_subtags(self) -> None:
+        request = copy.deepcopy(self.named)
+        request["args"]["language"] = "en" + "-a" * 200
+        self.refusal(request, "INVALID_REQUEST")
+
+    def test_ordinary_region_language_tag_is_accepted(self) -> None:
+        request = copy.deepcopy(self.named)
+        request["args"]["language"] = "en-US"
+        interface.validate_request(self.spec, request)
+
     def test_unhashable_request_enums_are_stably_refused(self) -> None:
         for field, code in (
             ("op", "UNKNOWN_OPERATION"),

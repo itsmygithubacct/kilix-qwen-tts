@@ -48,7 +48,9 @@ def seal(fd):
 
 def _copy(source: Path, destination_fd, check, header=lambda _info: None):
     digest = hashlib.sha256()
-    source_fd = os.open(source, os.O_RDONLY | os.O_NONBLOCK | os.O_CLOEXEC)
+    source_fd = os.open(
+        source, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC
+    )
     with os.fdopen(source_fd, "rb") as reader:
         info = os.fstat(reader.fileno())
         if (not stat.S_ISREG(info.st_mode) or info.st_uid != os.geteuid()

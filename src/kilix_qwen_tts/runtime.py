@@ -30,7 +30,9 @@ MAX_AUDIO_SECONDS = 900
 
 def digest_file(path: Path, check: Callable[[], None] = lambda: None) -> str:
     digest = hashlib.sha256()
-    descriptor = os.open(path, os.O_RDONLY | os.O_NONBLOCK | os.O_CLOEXEC)
+    descriptor = os.open(
+        path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC
+    )
     with os.fdopen(descriptor, "rb") as source:
         before = os.fstat(source.fileno())
         if not stat.S_ISREG(before.st_mode) or before.st_size > 4 * 1024**3:

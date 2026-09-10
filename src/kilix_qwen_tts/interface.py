@@ -79,7 +79,8 @@ TOP_LEVEL_FIELDS = {
 }
 
 TOKEN = re.compile(r"^[A-Za-z0-9._:+-]{1,64}$")
-LANGUAGE = re.compile(r"^[A-Za-z]{2,8}(?:-[A-Za-z0-9]{1,8})*$")
+LANGUAGE = re.compile(r"^[A-Za-z]{2,8}(?:-[A-Za-z0-9]{1,8}){0,7}$")
+LANGUAGE_MAX_CHARS = 64
 SHA256 = re.compile(r"^[0-9a-f]{64}$")
 UTC = re.compile(r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z$")
 
@@ -529,6 +530,7 @@ def validate_request(spec: dict[str, Any], request: Any) -> None:
     _utf8_length(args.get("text"), "text", spec["limits"]["text_utf8_bytes"])
     _token(args.get("model_id"), "model_id")
     _require(isinstance(args.get("language"), str)
+             and len(args["language"]) <= LANGUAGE_MAX_CHARS
              and LANGUAGE.fullmatch(args["language"]) is not None,
              "INVALID_REQUEST", "language is not a bounded language tag")
     seed = args.get("seed")
