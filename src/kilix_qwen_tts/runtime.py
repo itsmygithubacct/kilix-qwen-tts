@@ -28,9 +28,13 @@ MAX_RESULT_BYTES = 65_536
 MAX_AUDIO_SECONDS = 900
 
 
-def digest_file(path: Path, check: Callable[[], None] = lambda: None) -> str:
+def digest_file(path: Path, check: Callable[[], None] = lambda: None, *,
+                follow: bool = False) -> str:
     digest = hashlib.sha256()
-    descriptor = os.open(path, os.O_RDONLY | os.O_NONBLOCK | os.O_CLOEXEC)
+    flags = os.O_RDONLY | os.O_NONBLOCK | os.O_CLOEXEC
+    if not follow:
+        flags |= os.O_NOFOLLOW
+    descriptor = os.open(path, flags)
     with os.fdopen(descriptor, "rb") as source:
         before = os.fstat(source.fileno())
         if not stat.S_ISREG(before.st_mode) or before.st_size > 4 * 1024**3:
@@ -76,7 +80,7 @@ def tree_digest(root: Path, check: Callable[[], None] = lambda: None, *, allow_f
                 or info.st_mode & 0o022):
             raise ProtocolError("INVALID_RUNTIME", "environment contains unsafe files")
         digest.update(str(path.relative_to(root)).encode() + b"\0")
-        digest.update(bytes.fromhex(digest_file(path, check)))
+        digest.update(bytes.fromhex(digest_file(path, check, follow=allow_file_links)))
     return digest.hexdigest()
 
 
@@ -167,7 +171,7 @@ class InstalledRuntime:
                 if (self.root / name).is_symlink() or digest_file(self.root / name, check) != digest:
                     raise ProtocolError("INVALID_RUNTIME", "model changed; restart required")
         environment = self.manifest["environment"]
-        if (digest_file(self.python, check) != environment["python_sha256"]
+        if (digest_file(self.python, check, follow=True) != environment["python_sha256"]
                 or tree_digest(self.site_packages, check) != environment["site_packages_sha256"]
                 or tree_digest(self.python_root, check, allow_file_links=True) != environment["python_root_sha256"]):
             raise ProtocolError("INVALID_RUNTIME", "runtime environment changed; restart required")
