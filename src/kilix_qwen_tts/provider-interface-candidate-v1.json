@@ -1,0 +1,202 @@
+{
+  "schema": "kilix.qwen-tts.provider/candidate-v1",
+  "status": "QWEN_IMPLEMENTATION_CANDIDATE_NOT_FROZEN",
+  "protocol": {
+    "major": 1,
+    "minor": 0
+  },
+  "cli_operations": [
+    "serve",
+    "synthesize",
+    "models",
+    "status",
+    "cancel",
+    "unload"
+  ],
+  "wire_operations": [
+    "hello",
+    "submit",
+    "models",
+    "status",
+    "cancel",
+    "unload"
+  ],
+  "operation_requests": {
+    "hello": {
+      "job_id": "forbidden",
+      "args": [
+        "protocol_major",
+        "protocol_minor",
+        "max_control_frame_bytes",
+        "max_audio_chunk_bytes",
+        "max_descriptors_per_message"
+      ]
+    },
+    "submit": {
+      "job_id": "required",
+      "args": [
+        "task",
+        "text",
+        "model_id",
+        "language",
+        "instruction",
+        "seed",
+        "max_duration_ms",
+        "mode",
+        "voice_id",
+        "prompt_fd",
+        "prompt_audio",
+        "consent",
+        "description",
+        "output"
+      ]
+    },
+    "models": {
+      "job_id": "forbidden",
+      "args": []
+    },
+    "status": {
+      "job_id": "forbidden",
+      "args": []
+    },
+    "cancel": {
+      "job_id": "required",
+      "args": []
+    },
+    "unload": {
+      "job_id": "forbidden",
+      "args": []
+    }
+  },
+  "event_types": [
+    "hello",
+    "accepted",
+    "queued",
+    "loading",
+    "chunk",
+    "progress",
+    "result",
+    "canceled",
+    "error"
+  ],
+  "transport": {
+    "family": "AF_UNIX",
+    "type": "SOCK_SEQPACKET",
+    "peer_identity": "SO_PEERCRED_EFFECTIVE_UID",
+    "runtime_directory_mode": "0700",
+    "socket_mode": "0600",
+    "control_framing": "U32_BE_LENGTH_PLUS_UTF8_JSON",
+    "audio_transfer": "SCM_RIGHTS_DESCRIPTOR"
+  },
+  "limits": {
+    "control_frame_bytes": 65536,
+    "control_integer_bits": 213,
+    "control_json_depth": 16,
+    "control_json_nodes": 2048,
+    "control_key_utf8_bytes": 64,
+    "control_number_token_bytes": 64,
+    "request_id_bytes": 64,
+    "job_id_bytes": 64,
+    "text_utf8_bytes": 16384,
+    "instruction_utf8_bytes": 4096,
+    "voice_design_utf8_bytes": 4096,
+    "consent_purpose_utf8_bytes": 256,
+    "prompt_duration_ms": 30000,
+    "prompt_audio_bytes": 11520000,
+    "audio_chunk_frames": 48000,
+    "audio_chunk_bytes": 192000,
+    "audio_chunks_per_job": 65536,
+    "descriptors_per_message": 1,
+    "output_duration_ms": 900000,
+    "deadline_ms": 3600000,
+    "extension_fields": 32
+  },
+  "audio": {
+    "sample_formats": [
+      "s16le",
+      "f32le"
+    ],
+    "sample_rates_hz": [
+      24000,
+      48000
+    ],
+    "channels": [
+      1
+    ],
+    "descriptor_indices": [
+      0
+    ]
+  },
+  "synthesis_modes": {
+    "named_voice": {
+      "required": [
+        "voice_id"
+      ]
+    },
+    "prompt_clone": {
+      "required": [
+        "prompt_fd",
+        "prompt_audio",
+        "consent"
+      ],
+      "consent_schema": "kilix.voice.consent/candidate-v1"
+    },
+    "voice_design": {
+      "required": [
+        "description"
+      ]
+    }
+  },
+  "error_codes": [
+    "INCOMPATIBLE_PROTOCOL",
+    "INVALID_REQUEST",
+    "FORBIDDEN_FIELD",
+    "UNKNOWN_OPERATION",
+    "UNAUTHORIZED_PEER",
+    "LIMIT_EXCEEDED",
+    "UNSUPPORTED_CAPABILITY",
+    "CONSENT_REQUIRED",
+    "MODEL_MISSING",
+    "MODEL_BUSY",
+    "DEVICE_UNAVAILABLE",
+    "DEADLINE_EXCEEDED",
+    "CANCELED",
+    "WORKER_CRASH",
+    "MALFORMED_WORKER_RESULT",
+    "INSUFFICIENT_DISK",
+    "OUTPUT_COMMIT_FAILED",
+    "DESCRIPTOR_MISMATCH",
+    "INTERNAL_ERROR"
+  ],
+  "forbidden_request_fields": [
+    "path",
+    "url",
+    "command",
+    "shell",
+    "executable",
+    "environment",
+    "module",
+    "import"
+  ],
+  "request_argument_fields": [
+    "task",
+    "text",
+    "model_id",
+    "language",
+    "instruction",
+    "seed",
+    "max_duration_ms",
+    "mode",
+    "voice_id",
+    "prompt_fd",
+    "prompt_audio",
+    "consent",
+    "description",
+    "output",
+    "protocol_major",
+    "protocol_minor",
+    "max_control_frame_bytes",
+    "max_audio_chunk_bytes",
+    "max_descriptors_per_message"
+  ]
+}
