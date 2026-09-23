@@ -17,6 +17,12 @@ from kilix_qwen_tts.runtime import (
 )
 
 
+def interpreter_sha256(python: Path) -> str:
+    # A uv environment's bin/python is a symlink to the base interpreter; the
+    # installed runtime verifies it with follow=True, so bind the same bytes.
+    return digest_file(python, follow=True)
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--destination", type=Path, required=True)
@@ -52,7 +58,7 @@ def main():
                                             "show", f"{ENGINE_COMMIT}:{name}"])
         if hashlib.sha256(original).hexdigest() != digest_file(site / name):
             parser.error("installed Qwen bytes differ from pinned Git objects")
-    environment = {"python": str(python), "python_sha256": digest_file(python),
+    environment = {"python": str(python), "python_sha256": interpreter_sha256(python),
                    "site_packages": str(site), "site_packages_sha256": tree_digest(site),
                    "python_root": str(python_root),
                    "python_root_sha256": tree_digest(python_root, allow_file_links=True)}
