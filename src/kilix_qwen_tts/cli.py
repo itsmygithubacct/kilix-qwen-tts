@@ -36,14 +36,19 @@ def parser():
             sub.add_argument("--lease-device")
             sub.add_argument("--lease-namespace")
         elif command == "synthesize":
-            sub.add_argument("--output", type=Path)
-            sub.add_argument("--stream-pcm", action="store_true",
+            destination = sub.add_mutually_exclusive_group()
+            destination.add_argument("--output", type=Path)
+            destination.add_argument("--wav-stdout", action="store_true",
+                                     help="write the verified WAV to stdout; metadata goes to stderr")
+            destination.add_argument("--stream-pcm", action="store_true",
                              help="write incremental 24 kHz mono PCM16 to stdout; final metadata goes to stderr")
             mode = sub.add_mutually_exclusive_group()
             mode.add_argument("--prompt", type=Path)
             mode.add_argument("--description-file", type=Path)
             sub.add_argument("--consent-asserted", action="store_true")
             sub.add_argument("--voice-id", default="Vivian")
+            sub.add_argument("--model-id", default="auto")
+            sub.add_argument("--require-installed-asset", action="store_true")
             sub.add_argument("--language", default="en")
             sub.add_argument("--seed", type=int, default=0)
             sub.add_argument("--timeout", type=float, default=300)
@@ -107,9 +112,9 @@ def main(argv=None):
                     signal.signal(sig, lambda _sig, _frame: service.stop())
                 service.serve()
             return 0
-        if args.command == "synthesize" and (args.output is not None or args.stream_pcm):
+        if args.command == "synthesize" and (args.output is not None or args.stream_pcm or args.wav_stdout):
             text = sys.stdin.buffer.read(16_385).decode("utf-8")
-            request = {"task": "synthesize", "text": text, "model_id": "auto",
+            request = {"task": "synthesize", "text": text, "model_id": args.model_id,
                        "language": args.language, "seed": args.seed,
                        "max_duration_ms": args.max_duration_ms,
                        "mode": "prompt_clone" if args.prompt is not None else "named_voice",
@@ -143,7 +148,9 @@ def main(argv=None):
                         sys.stdout.buffer.flush()
                     result, audio = client_request(runtime_directory(), request_value(
                         "submit", job_id=uuid.uuid4().hex, args=request, timeout=args.timeout,
-                        stream=args.stream_pcm), descriptor, on_chunk=consume if args.stream_pcm else None)
+                        stream=args.stream_pcm,
+                        require_installed_asset=args.require_installed_asset), descriptor,
+                        on_chunk=consume if args.stream_pcm else None)
                 finally:
                     if descriptor is not None:
                         os.close(descriptor)
@@ -156,8 +163,11 @@ def main(argv=None):
                 except BaseException:
                     args.output.unlink(missing_ok=True)
                     raise
+            elif args.wav_stdout:
+                sys.stdout.buffer.write(audio)
+                sys.stdout.buffer.flush()
             print(json.dumps(result, separators=(",", ":"), sort_keys=True),
-                  file=sys.stderr if args.stream_pcm else sys.stdout)
+                  file=sys.stderr if args.stream_pcm or args.wav_stdout else sys.stdout)
             return 0
         if args.command in {"models", "status", "cancel", "unload"}:
             try:

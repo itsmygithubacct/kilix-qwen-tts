@@ -81,6 +81,26 @@ class SelectionTests(unittest.TestCase):
         result, _ = self.submit("voice_design", instruction="Speak softly.")
         self.assertEqual(result["model_id"], self.models[2].model_id)
 
+    def test_receipt_required_submit_refuses_local_stage_before_job(self):
+        self.start()
+        args = self.args("named_voice")
+        with self.assertRaises(ProtocolError) as caught:
+            client_request(self.fixture.ipc, request_value(
+                "submit", job_id="receipt-required", args=args, timeout=5,
+                require_installed_asset=True))
+        self.assertEqual(caught.exception.code, "UNSUPPORTED_CAPABILITY")
+        self.assertFalse(self.fixture.service._jobs)
+        self.models[1].model_source = object()
+        self.assertIs(self.fixture.service.select_runtime(
+            args, require_installed_asset=True), self.models[1])
+
+    def test_receipt_requirement_is_only_for_submit(self):
+        with self.assertRaises(ProtocolError):
+            request_value("models", require_installed_asset=True)
+        request = request_value("submit", job_id="receipt", args=self.args("named_voice"),
+                                require_installed_asset=True)
+        self.assertEqual(request["extensions"], {"x_require_installed_asset_v1": True})
+
     def test_busy_and_cancel_follow_the_active_selected_model(self):
         self.start()
         errors = []

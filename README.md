@@ -77,6 +77,14 @@ blocks a second submission with `BUSY`; cancellation completes only after
 owned descendants and temporary job files have been removed. Text and source
 paths do not appear in the worker command line or normal worker logs.
 
+Kilix Voice can use this executable from its system-Python daemon without
+importing the Python 3.12 inference environment. Its explicit named-voice
+request uses `--model-id qwen3-tts-0.6b-customvoice`,
+`--require-installed-asset`, and `--wav-stdout`: the verified WAV is written
+to stdout and result metadata to stderr. The receipt requirement is also
+enforced by the service on the submitted job, so an intervening provider
+restart cannot turn a receipt-backed probe into a local-stage synthesis.
+
 ## Runtime boundaries
 
 Linux with unprivileged user namespaces, root-owned `/usr/bin/bwrap` and system

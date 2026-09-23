@@ -81,10 +81,12 @@ class Service:
         self._slots = threading.BoundedSemaphore(8)
         self._threads: list[threading.Thread] = []
 
-    def select_runtime(self, arguments):
+    def select_runtime(self, arguments, *, require_installed_asset=False):
         for selected in self.runtimes:
             if (arguments["mode"] == selected.mode
                     and arguments["model_id"] in {"auto", selected.model_id}
+                    and (not require_installed_asset
+                         or getattr(selected, "model_source", None) is not None)
                     and not (selected.model_id == "qwen3-tts-0.6b-customvoice"
                              and arguments.get("instruction"))):
                 return selected
@@ -208,7 +210,9 @@ class Service:
                     raise ProtocolError("UNSUPPORTED_CAPABILITY", "language is not supported by this runtime")
                 if request.arguments["mode"] == "prompt_clone" and "instruction" in request.arguments:
                     raise ProtocolError("UNSUPPORTED_CAPABILITY", "clone runtime cannot apply instructions")
-                selected_runtime = self.select_runtime(request.arguments)
+                selected_runtime = self.select_runtime(
+                    request.arguments, require_installed_asset=value.get(
+                        "extensions", {}).get("x_require_installed_asset_v1") is True)
                 with self._mutex:
                     if self._unavailable:
                         raise ProtocolError("SUPERVISOR_FAILED", "owned cleanup remains unproven")
@@ -356,15 +360,21 @@ class Service:
 
 
 def request_value(operation: str, *, job_id: str | None = None,
-                  args: dict | None = None, timeout: float = 300, stream: bool = False) -> dict:
-    if type(stream) is not bool or (stream and operation != "submit"):
+                  args: dict | None = None, timeout: float = 300, stream: bool = False,
+                  require_installed_asset: bool = False) -> dict:
+    if (type(stream) is not bool or type(require_installed_asset) is not bool
+            or ((stream or require_installed_asset) and operation != "submit")):
         raise ProtocolError("INVALID_REQUEST", "invalid PCM stream selection")
     value = {"schema": PROTOCOL_SCHEMA, "type": "request", "request_id": uuid.uuid4().hex,
              "op": operation, "deadline_ms": int(timeout * 1000), "args": args or {}}
     if job_id is not None:
         value["job_id"] = job_id
-    if stream:
-        value["extensions"] = {"x_pcm_stream_v1": True}
+    if stream or require_installed_asset:
+        value["extensions"] = {}
+        if stream:
+            value["extensions"]["x_pcm_stream_v1"] = True
+        if require_installed_asset:
+            value["extensions"]["x_require_installed_asset_v1"] = True
     ProviderRequest.from_payload(value)
     return value
 
