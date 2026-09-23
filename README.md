@@ -137,13 +137,14 @@ Upstream source, dependencies and model licenses remain separate.
 
 ## Installed model descriptors
 
-The service can use the reviewed `kilix-content` installed-asset API instead
-of local model paths. Provision that shared package in the provider environment,
-then select a catalog asset at service startup:
+The service can use the reviewed `kilix-content` 0.2.2 packaged catalog and
+`kilix-license` receipt authority instead of local model paths. Provision both
+shared packages in the provider environment, then select a catalog asset at
+service startup:
 
 ```sh
 kilix-qwen-tts serve --runtime-root /absolute/runtime \
-  --installed-asset qwen3-tts-0.6b-base \
+  --installed-asset qwen3-tts-0.6b-customvoice \
   --content-root /absolute/installed-content \
   --model-snapshot-bytes 3000000000
 ```
@@ -151,22 +152,26 @@ kilix-qwen-tts serve --runtime-root /absolute/runtime \
 The byte argument is an explicit snapshot ceiling, not measured hardware
 admission. The runtime manifest still binds the exact model population and
 interpreter/dependencies. Its model files need not exist under `runtime-root`
-when this option is selected. The packaged catalog must contain the matching
-provider, consumer version, model revision and file digests; every job requires
-current durable license receipts and the complete installed population.
-No missing receipt or asset falls back to local model paths.
+when this option is selected. The verified packaged catalog must contain the
+matching provider, F104 stream, consumer version, model revision and file
+digests; the asset is read from `kilix-content`'s own install location under
+`--content-root`. No missing receipt or asset falls back to local model paths.
 
-Receipt storage opens once during service startup, under its bounded startup
-lock policy, and closes after service shutdown. Per-job receipt waits and
-snapshot reads share the job's cancellation/deadline checks, with an additional
-120-second snapshot ceiling. Read-only sealed member descriptors are checked
-and their actual bytes hashed into the immutable runtime bundle. The content
-snapshots close before process startup. No receipt is created by this provider,
+Every job first requires `kilix_license.require` to find a current receipt in
+the shared store (`kilix_license.receipt_store_root()`) covering the asset's
+licence record and manifest digest. It then reads the complete installed
+population without following links, refuses any undeclared, missing, non-regular
+or resized member, and copies each member into a sealed read-only memory file
+whose bytes must match the catalog digest. Those sealed descriptors are checked
+again and hashed into the immutable runtime bundle, then closed before process
+startup. Snapshot reads share the job's cancellation/deadline checks, with an
+additional 120-second snapshot ceiling. No receipt is created by this provider,
 and no catalog, release identity or model path is accepted on wire.
 
-Integration tests require the reviewed `kilix-content` package on `PYTHONPATH`;
-without it, those optional tests report skips. Their synthetic packaged catalog
-fixtures exercise the production authority and storage implementation without
+Integration tests require `kilix-content` and `kilix-license` on `PYTHONPATH`;
+without them, those optional tests report skips. Their synthetic packaged
+catalog fixtures mint receipts through the real agreement path into a private
+store and exercise the production coverage and snapshot implementation without
 admitting models to a release. Installed descriptors do not establish a
 qualified resource profile or full install-transaction authority.
 
