@@ -61,6 +61,18 @@ print(json.dumps(result))
 '''
 
 
+class ModelRecordTests(unittest.TestCase):
+    def test_asset_authority_distinguishes_receipted_and_development_runtime(self):
+        runtime = object.__new__(InstalledRuntime)
+        runtime.model_id = 'qwen3-tts-0.6b-customvoice'
+        runtime.model_revision = MODEL_CANDIDATES[runtime.model_id][0]
+        runtime.mode = 'named_voice'
+        runtime.model_source = None
+        self.assertEqual(runtime.model_record()['asset_authority'], 'local-stage')
+        runtime.model_source = object()
+        self.assertEqual(runtime.model_record()['asset_authority'], 'kilix-content')
+
+
 @unittest.skipUnless(Path('/usr/bin/bwrap').exists(), 'Linux namespace launcher is required')
 class RuntimeTests(unittest.TestCase):
     def setUp(self):

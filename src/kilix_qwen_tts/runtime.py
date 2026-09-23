@@ -180,7 +180,9 @@ class InstalledRuntime:
         return {"id": self.model_id, "revision": self.model_revision,
                 "engine_id": "qwen3-tts", "engine_revision": ENGINE_COMMIT,
                 "installed": True, "release_qualified": False, "device": "cpu",
-                "capabilities": [self.mode], "streaming": True}
+                "capabilities": [self.mode], "streaming": True,
+                "asset_authority": ("kilix-content" if self.model_source is not None
+                                    else "local-stage")}
 
 
 def stop_process(process: subprocess.Popen) -> None:
