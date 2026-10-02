@@ -168,6 +168,106 @@ class ContentTests(unittest.TestCase):
                 with changed.open(lambda: None):
                     self.fail("a receipt for a different manifest was accepted")
 
+    def test_writable_enclosing_directories_refuse_without_leaks(self):
+        with PackagedFixture() as fixture:
+            source = fixture.source()
+            for directory in (fixture.data, fixture.selected.parent, fixture.selected,
+                              fixture.selected / "model"):
+                with self.subTest(directory=directory.relative_to(fixture.root)):
+                    original_mode = directory.stat().st_mode & 0o777
+                    baseline = open_descriptors()
+                    directory.chmod(0o777)
+                    try:
+                        self.refuses(source, "shared-writable directory was accepted")
+                    finally:
+                        directory.chmod(original_mode)
+                    self.assertEqual(open_descriptors(), baseline)
+
+    def test_foreign_enclosing_and_nested_directory_owners_refuse(self):
+        with PackagedFixture() as fixture:
+            source = fixture.source()
+            original_stat, original_fstat = os.stat, os.fstat
+            for directory in (fixture.data, fixture.selected.parent, fixture.selected,
+                              fixture.selected / "model"):
+                identity = (directory.stat().st_dev, directory.stat().st_ino)
+                def foreign(info):
+                    if (info.st_dev, info.st_ino) == identity:
+                        values = list(info)
+                        values[4] = os.geteuid() + 10000
+                        return os.stat_result(values)
+                    return info
+                with self.subTest(directory=directory.relative_to(fixture.root)):
+                    baseline = open_descriptors()
+                    with patch.object(provider_content.os, "stat", side_effect=lambda *a, **k:
+                            foreign(original_stat(*a, **k))), patch.object(
+                            provider_content.os, "fstat", side_effect=lambda fd:
+                            foreign(original_fstat(fd))):
+                        self.refuses(source, "foreign-owned directory was accepted")
+                    self.assertEqual(open_descriptors(), baseline)
+
+    def test_nested_directory_changed_after_inventory_refuses(self):
+        with PackagedFixture() as fixture:
+            source = fixture.source()
+            nested = fixture.selected / "model"
+            original = os.fwalk
+            def change_after_walk(*args, **kwargs):
+                yield from original(*args, **kwargs)
+                nested.chmod(0o777)
+            baseline = open_descriptors()
+            with patch.object(provider_content.os, "fwalk", change_after_walk):
+                self.refuses(source, "unsafe member parent after inventory was accepted")
+            self.assertEqual(open_descriptors(), baseline)
+
+    def test_direct_member_parent_changed_after_inventory_refuses(self):
+        for mutation in ("mode", "owner"):
+            with self.subTest(mutation=mutation), PackagedFixture({"model.bin": b"model"}) as fixture:
+                source = fixture.source()
+                original_walk, original_fstat = os.fwalk, os.fstat
+                identity = (fixture.selected.stat().st_dev, fixture.selected.stat().st_ino)
+                inventory_finished = False
+                def change_after_walk(*args, **kwargs):
+                    nonlocal inventory_finished
+                    yield from original_walk(*args, **kwargs)
+                    inventory_finished = True
+                    if mutation == "mode":
+                        fixture.selected.chmod(0o777)
+                def changed_owner(descriptor):
+                    info = original_fstat(descriptor)
+                    if (mutation == "owner" and inventory_finished
+                            and (info.st_dev, info.st_ino) == identity):
+                        values = list(info)
+                        values[4] = os.geteuid() + 10000
+                        return os.stat_result(values)
+                    return info
+                baseline = open_descriptors()
+                with patch.object(provider_content.os, "fwalk", change_after_walk), patch.object(
+                        provider_content.os, "fstat", changed_owner):
+                    self.refuses(source, "unsafe direct member parent was accepted")
+                self.assertEqual(open_descriptors(), baseline)
+
+    def test_content_root_replaced_by_a_symlink_refuses(self):
+        with PackagedFixture() as fixture:
+            source = fixture.source()
+            moved = fixture.root / "moved-content"
+            fixture.data.rename(moved)
+            fixture.data.symlink_to(moved, target_is_directory=True)
+            baseline = open_descriptors()
+            self.refuses(source, "replacement content-root symlink was accepted")
+            self.assertEqual(open_descriptors(), baseline)
+
+    def test_declined_agreement_cannot_admit_a_model(self):
+        with PackagedFixture(receipt=False) as fixture:
+            record = license.RecordIndex(license.load_determined_records()).by_digest(
+                fixture.spec.licenses[0].record_digest)
+            with self.assertRaises(license.AgreementRequired):
+                license.capture_agreement(record, "no")
+            source = fixture.source()
+            with patch("kilix_qwen_tts.sandbox.memory_file",
+                       side_effect=AssertionError("declined model must not be copied")):
+                with self.assertRaises(ProtocolError):
+                    with source.open(lambda: None):
+                        self.fail("declined agreement admitted a model")
+
     def test_consumer_revision_population_and_budget_refusals(self):
         with PackagedFixture() as fixture:
             for options in ({"provider": "wrong-provider"}, {"consumer_schema": "wrong-schema"},

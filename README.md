@@ -331,3 +331,10 @@ The client rechecks that deadline after validation, immediately before returning
 output or invoking the PCM consumer. Expired output is refused with
 `DEADLINE_EXCEEDED`. Legacy submit calls without a cancellation callback retain
 their existing six-second supervisor grace; short control calls receive no grace.
+
+Installed model directory chains must be owned by the current user or root
+and must not permit group or other writes. The nominated Content root and all
+held descendant directories are checked; replacing the root with a symlink
+refuses. Member files still require current-user ownership and exact catalog
+bytes. This directory policy does not establish hardware admission or release
+qualification.

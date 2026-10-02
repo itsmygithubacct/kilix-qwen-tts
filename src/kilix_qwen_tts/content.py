@@ -144,8 +144,8 @@ class InstalledModel:
                 check()
                 for name in dirs:
                     info = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
-                    if (not stat.S_ISDIR(info.st_mode) or info.st_mode & 0o022
-                            or os.path.normpath(os.path.join(directory, name)) not in ancestors):
+                    self._check_directory(info)
+                    if os.path.normpath(os.path.join(directory, name)) not in ancestors:
                         raise ProtocolError("INVALID_RUNTIME", "undeclared installed model directory")
                 for name in names:
                     info = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
@@ -191,17 +191,25 @@ class InstalledModel:
 
     def _open_asset_directory(self) -> int:
         """The operator chooses the content root; nothing beneath it is followed."""
-        flags = os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC
+        flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC
         directory = os.open(self.root, flags)
         try:
+            self._check_directory(os.fstat(directory))
             for part in self.relative:
                 child = os.open(part, flags | os.O_NOFOLLOW, dir_fd=directory)
                 os.close(directory)
                 directory = child
+                self._check_directory(os.fstat(directory))
             return directory
         except BaseException:
             os.close(directory)
             raise
+
+    @staticmethod
+    def _check_directory(info) -> None:
+        if (not stat.S_ISDIR(info.st_mode) or info.st_uid not in {0, os.geteuid()}
+                or info.st_mode & 0o022):
+            raise ProtocolError("INVALID_RUNTIME", "unsafe installed model directory")
 
     @staticmethod
     def _open_member(root: int, name: str) -> int:
@@ -210,11 +218,13 @@ class InstalledModel:
             raise ProtocolError("INVALID_RUNTIME", "unsafe installed model member")
         parent = os.dup(root)
         try:
+            InstalledModel._check_directory(os.fstat(parent))
             for part in parts[:-1]:
                 child = os.open(part, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC,
                                 dir_fd=parent)
                 os.close(parent)
                 parent = child
+                InstalledModel._check_directory(os.fstat(parent))
             return os.open(parts[-1], os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC,
                            dir_fd=parent)
         finally:
