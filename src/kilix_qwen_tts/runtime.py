@@ -94,7 +94,9 @@ MODEL_CANDIDATES = {
 
 
 class InstalledRuntime:
-    def __init__(self, root: Path, *, model_source=None):
+    def __init__(self, root: Path, *, model_source=None,
+                 check: Callable[[], None] = lambda: None):
+        check()
         self.root = private_directory(root)
         self.model_source = model_source
         path = root / "runtime.json"
@@ -139,7 +141,7 @@ class InstalledRuntime:
             info = (root / name).lstat()
             if (not stat.S_ISREG(info.st_mode) or info.st_uid != os.geteuid()
                     or info.st_mode & 0o022 or type(expected) is not str
-                    or digest_file(root / name) != expected):
+                    or digest_file(root / name, check) != expected):
                 raise ProtocolError("INVALID_RUNTIME", "model file identity mismatch")
         if model_source is None:
             actual = {str(p.relative_to(root)) for p in (root / "model").rglob("*") if not p.is_dir()}
@@ -163,7 +165,7 @@ class InstalledRuntime:
         self.model_revision = model["revision"]
         self.mode = MODEL_CANDIDATES[self.model_id][1]
         self.manifest = value
-        self.verify_unchanged()
+        self.verify_unchanged(check)
 
     def verify_unchanged(self, check: Callable[[], None] = lambda: None) -> None:
         if self.model_source is None:

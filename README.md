@@ -61,6 +61,28 @@ pinned Git objects and records the complete interpreter/dependency population.
 It downloads nothing. Its `kilix.qwen-tts.runtime/v1` manifest is a development
 byte binding, **not an F100 install/license receipt**.
 
+To stage a model already installed through Kilix Content, use the same managed
+environment with the packaged Content and Licence APIs available:
+
+```sh
+python3 tools/stage_installed_runtime.py \
+  --destination /absolute/private/installed-runtime \
+  --environment /absolute/cpu-environment \
+  --source-checkout /absolute/pinned/Qwen3-TTS \
+  --installed-asset qwen3-tts-0.6b-customvoice \
+  --content-root /absolute/desktop-apps \
+  --model-snapshot-bytes 3221225472
+```
+
+This creates only `runtime.json`. It verifies current licence coverage and the
+complete installed asset before environment inspection and again before
+completion; it never copies models or grants consent. Serve it with the same
+`--installed-asset`, `--content-root`, and `--model-snapshot-bytes` options in
+addition to `--runtime-root`. The provider checks coverage and seals the model
+files for each job. Staging has a 300-second deadline (maximum 600 seconds),
+observes interruption during hashing and probes, and removes its own new
+destination on failure. Probe descendants are reaped by a dedicated supervisor.
+
 The client reads synthesis text from standard input and writes a new private
 WAV file. Prompt files must be owned, canonical 24 kHz mono PCM16 WAV, at most
 30 seconds, with explicit consent:
