@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Create a new CPU environment from the committed lock and pinned engine."""
+"""Create a new CPU or CUDA environment from the committed lock and pinned engine."""
 from __future__ import annotations
 
 import argparse
@@ -18,6 +18,9 @@ import tempfile
 import time
 
 
+# One locked dependency group per device. A CUDA environment carries the
+# CUDA 12.4 torch build; it can still run on the CPU at job time.
+DEVICE_GROUPS = {"cpu": ("cpu", "2.6.0+cpu"), "cuda": ("cuda", "2.6.0+cu124")}
 _STOPPING = False
 _DIRECTORY = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC
 
@@ -142,7 +145,7 @@ def _run(command, environment, destination, deadline, *, capture=False):
             while process.poll() is None:
                 destination.check()
                 if time.monotonic() >= deadline:
-                    raise TimeoutError("CPU environment build deadline exceeded")
+                    raise TimeoutError("environment build deadline exceeded")
                 if capture and os.fstat(output.fileno()).st_size > 65_536:
                     raise ValueError("environment probe output exceeds its bound")
                 time.sleep(.02)
@@ -154,7 +157,7 @@ def _run(command, environment, destination, deadline, *, capture=False):
                 process.wait()
         destination.check()
         if time.monotonic() >= deadline:
-            raise TimeoutError("CPU environment build deadline exceeded")
+            raise TimeoutError("environment build deadline exceeded")
         if capture:
             output.seek(0)
             payload = output.read(65_537)
@@ -170,6 +173,7 @@ def _build(argv) -> int:
     parser.add_argument("--uv", type=Path, required=True)
     parser.add_argument("--cache-directory", type=Path)
     parser.add_argument("--offline", action="store_true")
+    parser.add_argument("--device", choices=tuple(DEVICE_GROUPS), default="cpu")
     parser.add_argument("--timeout", type=float, default=1800)
     args = parser.parse_args(argv)
     if not math.isfinite(args.timeout) or not 0 < args.timeout <= 3600:
@@ -198,25 +202,32 @@ def _build(argv) -> int:
         command.append("--offline")
     with Destination(destination) as stage:
         _run(command + ["--only-group", "build"], environment, stage, deadline)
-        _run(command + ["--group", "cpu", "--group", "build", "--no-build-isolation"],
+        group, torch_version = DEVICE_GROUPS[args.device]
+        _run(command + ["--group", group, "--group", "build", "--no-build-isolation"],
              environment, stage, deadline)
         probe = (
             "import importlib.metadata,json,sys; "
             "assert sys.version_info[:3] == (3,12,8); "
             "d={p.metadata['Name'].lower().replace('_','-'):p.version "
             "for p in importlib.metadata.distributions()}; "
-            "assert d['torch']=='2.6.0+cpu' and d['torchaudio']=='2.6.0+cpu'; "
+            f"assert d['torch']=={torch_version!r} and d['torchaudio']=={torch_version!r}; "
             "assert 'gradio' not in d and 'kilix-qwen-tts' not in d; "
             "print(json.dumps(d,sort_keys=True))"
         )
         packages = json.loads(_run([str(destination / "bin/python"), "-I", "-B", "-c", probe],
                                   environment, stage, deadline, capture=True))
+        # The controller rechecks what the environment reported, not only the
+        # interpreter's own assertion.
+        if (type(packages) is not dict or packages.get("torch") != torch_version
+                or packages.get("torchaudio") != torch_version):
+            raise RuntimeError("environment torch build does not match the requested device")
         if any(hashlib.sha256((root / name).read_bytes()).hexdigest() != digest
                for name, digest in inputs.items()):
             raise RuntimeError("build inputs changed during environment creation")
         receipt = {"schema": "kilix.qwen-tts.environment-build/v1",
                    "inputs": inputs, "packages": packages,
                    "python_version": "3.12.8", "offline": args.offline,
+                   "device": args.device,
                    "uv_sha256": hashlib.sha256(args.uv.read_bytes()).hexdigest()}
         stage.check()
         descriptor = os.open("kilix-environment-build.json", os.O_WRONLY | os.O_CREAT | os.O_EXCL

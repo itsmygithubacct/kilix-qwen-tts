@@ -17,8 +17,31 @@ BWRAP = "/usr/bin/bwrap"
 MAX_FILES = 40_000
 MAX_TREE_BYTES = 4 * 1024**3
 MAX_BUNDLE_BYTES = 7 * 1024**3
+# A CUDA environment carries about 4.5 GiB of CUDA libraries. Its bundle and
+# file-count bounds are separate; the bootstrap applies the same profile.
+PROFILES = {"cpu": (MAX_BUNDLE_BYTES, MAX_FILES), "cuda": (14 * 1024**3, 60_000)}
+# Only physical GPU 0 and the control/unified-memory nodes CUDA needs.
+GPU_NODES = ("/dev/nvidiactl", "/dev/nvidia-uvm", "/dev/nvidia0")
+# CUDA initialisation refuses (error 304) unless both kernel modules report
+# their state; the worker sees these two read-only files and no other sysfs.
+GPU_SYSFS = ("/sys/module/nvidia/initstate", "/sys/module/nvidia_uvm/initstate")
 BUNDLE_MAGIC = b"KQRT\x01"
 RECORD = struct.Struct("!HQB")
+
+
+def _character_device(path) -> bool:
+    try:
+        return stat.S_ISCHR(os.stat(path).st_mode)
+    except OSError:
+        return False
+
+
+def accelerator_nodes():
+    """(host, sandbox) GPU 0 node pairs, only when every required node exists."""
+    if (not all(_character_device(path) for path in GPU_NODES)
+            or not all(os.path.isfile(path) for path in GPU_SYSFS)):
+        return ()
+    return tuple((path, path) for path in GPU_NODES)
 
 
 def memory_file():
@@ -81,8 +104,18 @@ def snapshot(source: Path, check):
 
 
 @contextmanager
-def launch(runtime, workspace: str, audio_fd: int | None, check, *, prompt_embedding=None):
+def launch(runtime, workspace: str, audio_fd: int | None, check, *, prompt_embedding=None,
+           gpu_nodes=()):
     """Verify actual copied bytes, then unpack only that immutable population."""
+    profile = getattr(runtime, "device", "cpu")
+    if profile not in PROFILES or type(gpu_nodes) is not tuple or (gpu_nodes and profile != "cuda"):
+        raise ProtocolError("INVALID_RUNTIME", "unsupported runtime device profile")
+    if gpu_nodes and (any(type(pair) is not tuple or len(pair) != 2 for pair in gpu_nodes)
+                      or sorted(target for _source, target in gpu_nodes) != sorted(GPU_NODES)
+                      or not all(type(source) is str and _character_device(source)
+                                 for source, _target in gpu_nodes)):
+        raise ProtocolError("INVALID_RUNTIME", "unsafe accelerator device nodes")
+    bundle_limit, file_limit = PROFILES[profile]
     # System launcher/interpreter/libraries are root-owned inputs. No caller-
     # writable Python, package, model or prompt path is exposed to the worker.
     for executable in (BWRAP, "/usr/bin/python3"):
@@ -102,13 +135,13 @@ def launch(runtime, workspace: str, audio_fd: int | None, check, *, prompt_embed
             encoded = destination.encode("utf-8")
             if (relative.is_absolute() or str(relative) != destination or ".." in relative.parts
                     or not encoded or len(encoded) > 4096 or destination in names
-                    or len(names) >= MAX_FILES):
+                    or len(names) >= file_limit):
                 raise ProtocolError("INVALID_RUNTIME", "unsafe runtime bundle path")
             names.add(destination)
             def header(info):
                 nonlocal total_bytes
                 total_bytes += info.st_size
-                if total_bytes > MAX_BUNDLE_BYTES:
+                if total_bytes > bundle_limit:
                     raise ProtocolError("LIMIT_EXCEEDED", "runtime snapshot exceeds its bound")
                 _write(bundle, RECORD.pack(len(encoded), info.st_size, bool(info.st_mode & 0o111)) + encoded)
             return _copy(source, bundle, check, header)[0]
@@ -157,7 +190,7 @@ def launch(runtime, workspace: str, audio_fd: int | None, check, *, prompt_embed
             payload = validate_embedding(prompt_embedding)
             name = b"prompt.embedding"
             total_bytes += len(payload)
-            if total_bytes > MAX_BUNDLE_BYTES or len(names) >= MAX_FILES:
+            if total_bytes > bundle_limit or len(names) >= file_limit:
                 raise ProtocolError("LIMIT_EXCEEDED", "runtime snapshot exceeds its bound")
             _write(bundle, RECORD.pack(len(name), len(payload), False) + name + payload)
         _write(bundle, RECORD.pack(0, 0, 0))
@@ -168,10 +201,17 @@ def launch(runtime, workspace: str, audio_fd: int | None, check, *, prompt_embed
                    "--cap-add", "CAP_SYS_ADMIN", "--ro-bind", "/usr", "/usr",
                    "--symlink", "usr/bin", "/bin", "--symlink", "usr/lib", "/lib",
                    "--symlink", "usr/lib64", "/lib64",
-                   "--proc", "/proc", "--dev", "/dev", "--tmpfs", "/tmp", "--dir", "/opt",
-                   "--bind", workspace, "/job", "--chdir", "/job",
-                   "--ro-bind-data", str(bootstrap), "/bootstrap.py", "--",
-                   "/usr/bin/python3", "-I", "-B", "/bootstrap.py", str(bundle)]
+                   "--proc", "/proc", "--dev", "/dev"]
+        # A GPU job sees only the checked NVIDIA nodes, at their host paths.
+        for source, target in gpu_nodes:
+            command += ["--dev-bind", source, target]
+        if gpu_nodes:
+            for path in GPU_SYSFS:
+                command += ["--ro-bind-try", path, path]
+        command += ["--tmpfs", "/tmp", "--dir", "/opt",
+                    "--bind", workspace, "/job", "--chdir", "/job",
+                    "--ro-bind-data", str(bootstrap), "/bootstrap.py", "--",
+                    "/usr/bin/python3", "-I", "-B", "/bootstrap.py", str(bundle), profile]
         # A dedicated host-side subreaper owns bwrap and its whole PID tree.
         # Returning from cancel cannot race namespace teardown or adopt the
         # embedding application's unrelated children.

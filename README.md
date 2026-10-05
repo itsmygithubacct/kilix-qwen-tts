@@ -19,7 +19,8 @@ installations and unsupported capabilities refuse.
 
 The provider/client wheel has no inference dependencies. Its CPU environment
 is a separate group in the committed `uv.lock`, using uv 0.12.5 and CPython
-3.12.8. The lock pins the complete dependency graph, CPU PyTorch wheels and
+3.12.8 (a `cuda` group is described below). The lock pins the complete
+dependency graph, CPU and CUDA 12.4 PyTorch wheels and
 exact upstream engine commit. The upstream Gradio demonstration server is
 explicitly excluded; the provider uses only the engine API. Build tools are
 installed from the lock before third-party builds run without build isolation.
@@ -136,6 +137,40 @@ qualified RAM profile. Snapshot copy work observes cancellation/deadlines.
 The trusted bootstrap applies hard CPU, address-space, file-size and descriptor
 limits before executing the staged interpreter; all model code inherits them.
 A crash, timeout, disconnect or canceled job releases its worker slot.
+
+## CUDA runtimes and the CPU fallback
+
+The `cuda` dependency group is the same engine on PyTorch `2.6.0+cu124`; it
+conflicts with `cpu`, so one environment carries exactly one torch build. Build
+it with `tools/build_environment.py --device cuda`; the build refuses an
+environment whose reported torch build is not the requested one. Stage with
+`--device cuda` (`stage_runtime.py` or `stage_installed_runtime.py`): staging
+reads the environment's torch version and refuses a mismatch, and the runtime
+manifest records `"device": "cuda"`. A `cpu` manifest needs the CPU build.
+
+No wire request selects a device. For a `cuda` runtime the host offers the GPU
+only when `/dev/nvidiactl`, `/dev/nvidia-uvm` and `/dev/nvidia0` are character
+devices and both `/sys/module/nvidia/initstate` and
+`/sys/module/nvidia_uvm/initstate` exist. The namespace then gains exactly
+those three nodes (`--dev-bind`) and those two read-only sysfs files, which
+CUDA initialisation requires; it sees no other device or sysfs entry, and
+`CUDA_VISIBLE_DEVICES=0`. A `cpu` runtime is never offered the GPU.
+
+Inside the job the worker uses CUDA only when torch can initialise it, with
+bfloat16 where the GPU supports it and float16 otherwise. If CUDA is not
+offered or not usable, or a CUDA memory/runtime error occurs before any PCM was
+delivered, the same job runs on the CPU in float32 from the same seed, which is
+the computation a CPU runtime performs. The worker reports the device it used;
+the host refuses a GPU claim for a job that was not offered the GPU, keeps the
+device out of the client result and records it on the runtime as
+`last_device`. `models` reports each runtime's configured `device`.
+
+A CUDA environment holds about 4.5 GiB of CUDA libraries, and every job copies
+and verifies them like any other runtime byte. The `cuda` profile therefore
+snapshots up to 60,000 files and 14 GiB, with a matching private tmpfs, and
+bounds private writable data (`RLIMIT_DATA`, 24 GiB) instead of address space,
+because CUDA reserves address space it never backs. The other ceilings are
+unchanged. These are controls, not a qualified GPU or RAM profile.
 
 ## Checks and qualification
 

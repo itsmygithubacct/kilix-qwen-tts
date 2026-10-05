@@ -1,4 +1,4 @@
-"""An installed, digest-bound Qwen CPU runtime and supervised jobs.
+"""An installed, digest-bound Qwen CPU or CUDA runtime and supervised jobs.
 
 The installation manifest names files below the provider's own installation.
 It is read only at service startup; job requests cannot choose files or tools.
@@ -26,6 +26,9 @@ ENGINE_COMMIT = "6cafe5582caea83df269c36b1ce62d953a9cc66b"
 MAX_INPUT_BYTES = 11_520_000
 MAX_RESULT_BYTES = 65_536
 MAX_AUDIO_SECONDS = 900
+# A "cuda" runtime has a CUDA torch environment. It is offered the GPU only
+# when the host has the NVIDIA nodes, and otherwise runs on the CPU.
+DEVICES = ("cpu", "cuda")
 
 
 def digest_file(path: Path, check: Callable[[], None] = lambda: None, *,
@@ -112,7 +115,7 @@ class InstalledRuntime:
         value = decode_payload(payload)
         if (set(value) != {"schema", "engine_revision", "model", "files", "environment", "device"}
                 or value["schema"] != RUNTIME_SCHEMA or value["engine_revision"] != ENGINE_COMMIT
-                or value["device"] != "cpu"):
+                or type(value["device"]) is not str or value["device"] not in DEVICES):
             raise ProtocolError("INVALID_RUNTIME", "unsupported runtime identity or device")
         model = value["model"]
         if (type(model) is not dict or set(model) != {"id", "revision"}
@@ -161,6 +164,8 @@ class InstalledRuntime:
         if (not self.python.is_absolute() or not self.site_packages.is_absolute() or not self.python_root.is_absolute()
                 or not os.access(self.python, os.X_OK)):
             raise ProtocolError("INVALID_RUNTIME", "invalid runtime interpreter")
+        self.device = value["device"]
+        self.last_device = None
         self.model_id = model["id"]
         self.model_revision = model["revision"]
         self.mode = MODEL_CANDIDATES[self.model_id][1]
@@ -181,7 +186,8 @@ class InstalledRuntime:
     def model_record(self) -> dict:
         return {"id": self.model_id, "revision": self.model_revision,
                 "engine_id": "qwen3-tts", "engine_revision": ENGINE_COMMIT,
-                "installed": True, "release_qualified": False, "device": "cpu",
+                "installed": True, "release_qualified": False,
+                "device": getattr(self, "device", "cpu"),
                 "capabilities": [self.mode], "streaming": True,
                 "asset_authority": ("kilix-content" if self.model_source is not None
                                     else "local-stage")}
@@ -233,18 +239,30 @@ def _run_owned_job(runtime, audio_fd, args, *, deadline, cancel, disconnected, o
         raise ProtocolError("LIMIT_EXCEEDED", "prompt exceeds its bound")
     # File descriptors carry audio; the isolated worker's argv carries no text,
     # transcript, source filename, or model paths supplied by a client.
-    from .sandbox import launch
+    from .sandbox import accelerator_nodes, launch
+    profile = getattr(runtime, "device", "cpu")
+    if profile not in DEVICES:
+        raise ProtocolError("INVALID_RUNTIME", "unsupported runtime device")
+    # The host, never a request, decides whether this job is offered the GPU.
+    gpu_nodes = accelerator_nodes() if profile == "cuda" else ()
+    offered = "cuda" if gpu_nodes else "cpu"
     environment = {"PATH": "/usr/bin:/bin", "LANG": "C.UTF-8",
                    "OMP_NUM_THREADS": "2", "OPENBLAS_NUM_THREADS": "2",
                    "HF_HUB_OFFLINE": "1", "TRANSFORMERS_OFFLINE": "1",
                    "PYTHONDONTWRITEBYTECODE": "1", "TOKENIZERS_PARALLELISM": "false"}
+    if offered == "cuda":
+        environment.update(CUDA_VISIBLE_DEVICES="0", CUDA_CACHE_DISABLE="1",
+                           CUDA_MODULE_LOADING="LAZY")
     if (on_embedding is not None and (not callable(on_embedding) or args["mode"] != "prompt_clone")
             or prompt_embedding is not None and on_embedding is None):
         raise ProtocolError("INVALID_REQUEST", "invalid prompt cache selection")
     cache_options = {"prompt_embedding": prompt_embedding} if prompt_embedding is not None else {}
+    if gpu_nodes:
+        cache_options["gpu_nodes"] = gpu_nodes
     with tempfile.TemporaryDirectory(prefix="kilix-qwen-job-") as workspace, tempfile.TemporaryFile() as output, launch(runtime, workspace, audio_fd, check, **cache_options) as (command, descriptors):
         job = {"runtime": "/opt/runtime", "manifest": runtime.manifest,
-               "audio_fd": None, "args": args, "workspace": "/job"}
+               "audio_fd": None, "args": args, "workspace": "/job",
+               "profile": profile, "device": offered}
         if on_embedding is not None:
             job.update(prompt_cache=True, prompt_cache_input=prompt_embedding is not None)
         stream = None
@@ -288,10 +306,14 @@ def _run_owned_job(runtime, audio_fd, args, *, deadline, cancel, disconnected, o
                     result = decode_payload(payload)
                 except (ProtocolError, ValueError, UnicodeDecodeError) as error:
                     raise ProtocolError("ENGINE_FAILED", "invalid worker result") from error
-            required = {"engine_id", "engine_revision", "model_id", "model_revision", "duration_ms", "seed", "audio"}
+            required = {"engine_id", "engine_revision", "model_id", "model_revision", "duration_ms", "seed",
+                        "audio", "device"}
             if args["mode"] == "prompt_clone":
                 required.add("conditioning")
+            # The worker reports where it ran; it may fall back to the CPU but
+            # can never claim a GPU that this job was not offered.
             if (type(result) is not dict or set(result) != required
+                    or type(result.get("device")) is not str or result["device"] not in {"cpu", offered}
                     or result.get("engine_revision") != ENGINE_COMMIT or result.get("engine_id") != "qwen3-tts"
                     or result.get("model_id") != runtime.model_id or result.get("model_revision") != runtime.model_revision
                     or type(result.get("seed")) is not int or result["seed"] != args["seed"]
@@ -327,6 +349,8 @@ def _run_owned_job(runtime, audio_fd, args, *, deadline, cancel, disconnected, o
                 from .prompt_cache import read_embedding
                 check()
                 on_embedding(read_embedding(Path(workspace) / "prompt.embedding"))
+            # The client result contract is unchanged; the device stays local.
+            runtime.last_device = result.pop("device")
             return result, payload
         finally:
             owner.finish(process, stop_process)

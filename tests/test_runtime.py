@@ -22,13 +22,27 @@ from kilix_qwen_tts.sandbox import BUNDLE_MAGIC, RECORD, launch, memory_file, se
 from kilix_qwen_tts.service import Service, client_request, request_value
 
 ENGINE = '''#!/usr/bin/python3
-import hashlib,json,os,pathlib,resource,signal,subprocess,sys,time,wave
-assert resource.getrlimit(resource.RLIMIT_AS)==(20*1024**3,20*1024**3)
+import hashlib,json,os,pathlib,resource,signal,stat,subprocess,sys,time,wave
+request=json.load(sys.stdin);args=request['args']
+profile=request.get('profile','cpu');offered=request.get('device','cpu')
+assert profile in ('cpu','cuda') and offered in ('cpu',profile)
+if profile=='cpu':
+    assert resource.getrlimit(resource.RLIMIT_AS)==(20*1024**3,20*1024**3)
+else:
+    assert resource.getrlimit(resource.RLIMIT_DATA)==(24*1024**3,24*1024**3)
+    assert resource.getrlimit(resource.RLIMIT_AS)!=(20*1024**3,20*1024**3)
 assert resource.getrlimit(resource.RLIMIT_CPU)==(3600,3600)
 assert resource.getrlimit(resource.RLIMIT_FSIZE)==(64*1024**2,64*1024**2)
 assert resource.getrlimit(resource.RLIMIT_NOFILE)==(128,128)
 assert resource.getrlimit(resource.RLIMIT_CORE)==(0,0)
-request=json.load(sys.stdin);args=request['args']
+nodes=[pathlib.Path(p) for p in ('/dev/nvidiactl','/dev/nvidia-uvm','/dev/nvidia0')]
+if offered=='cuda':
+    assert all(stat.S_ISCHR(n.stat().st_mode) for n in nodes)
+    assert os.environ.get('CUDA_VISIBLE_DEVICES')=='0'
+else:
+    assert not any(n.exists() for n in nodes) and 'CUDA_VISIBLE_DEVICES' not in os.environ
+used=offered if args['text']!='no-gpu' else 'cpu'
+if args['text']=='claim-gpu':used='cuda'
 assert pathlib.Path('/opt/runtime/model/data').read_bytes()==b'model bytes'
 assert pathlib.Path('/opt/python/lib/python3.12/site-packages/data').read_bytes()==b'dependency bytes'
 assert not pathlib.Path(HOST_PATH).exists()
@@ -49,7 +63,7 @@ with wave.open(str(destination),'wb') as output:
     output.setnchannels(1);output.setsampwidth(2);output.setframerate(24000)
     output.writeframes(b'\\x01\\x00'*2400)
 payload=destination.read_bytes();manifest=request['manifest']
-result={'engine_id':'qwen3-tts','engine_revision':ENGINE_REVISION,
+result={'engine_id':'qwen3-tts','engine_revision':ENGINE_REVISION,'device':used,
         'model_id':manifest['model']['id'],'model_revision':manifest['model']['revision'],
         'duration_ms':100,'seed':args['seed'],'audio':{'byte_length':len(payload),'sha256':hashlib.sha256(payload).hexdigest()}}
 if args['mode']=='prompt_clone':

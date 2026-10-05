@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Bind an owned CPU environment to receipt-covered Content without copying models."""
+"""Bind an owned CPU or CUDA environment to receipt-covered Content without copying models."""
 from __future__ import annotations
 
 import argparse
@@ -14,7 +14,7 @@ import time
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'src'))
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from kilix_qwen_tts.content import InstalledModel
-from kilix_qwen_tts.runtime import ENGINE_COMMIT, MODEL_CANDIDATES, RUNTIME_SCHEMA, InstalledRuntime
+from kilix_qwen_tts.runtime import DEVICES, ENGINE_COMMIT, MODEL_CANDIDATES, RUNTIME_SCHEMA, InstalledRuntime
 from build_environment import Destination
 from stage_runtime import environment_record
 
@@ -27,8 +27,10 @@ def cancel(_signum, _frame):
 
 
 def stage(destination: Path, environment: Path, source_checkout: Path,
-          model: InstalledModel, *, timeout: float = 300) -> dict:
+          model: InstalledModel, *, timeout: float = 300, device: str = 'cpu') -> dict:
     """Publish only a verified manifest into a pinned, newly owned directory."""
+    if device not in DEVICES:
+        raise ValueError('unsupported runtime device')
     if not math.isfinite(timeout) or not 0 < timeout <= 600:
         raise ValueError('staging timeout must be positive and at most600 seconds')
     deadline = time.monotonic() + timeout
@@ -53,8 +55,8 @@ def stage(destination: Path, environment: Path, source_checkout: Path,
         def checkpoint():
             check()
             held.check()
-        bound = environment_record(environment, source_checkout, checkpoint, deadline=deadline)
-        value = {'schema': RUNTIME_SCHEMA, 'engine_revision': ENGINE_COMMIT, 'device': 'cpu',
+        bound = environment_record(environment, source_checkout, checkpoint, deadline=deadline, device=device)
+        value = {'schema': RUNTIME_SCHEMA, 'engine_revision': ENGINE_COMMIT, 'device': device,
                  'model': {'id': spec.asset_id, 'revision': spec.version},
                  'files': files, 'environment': bound}
         descriptor = os.open('runtime.json', os.O_WRONLY | os.O_CREAT | os.O_EXCL
@@ -85,6 +87,7 @@ def main(argv=None) -> int:
     parser.add_argument('--content-root', type=Path, required=True)
     parser.add_argument('--model-snapshot-bytes', type=int, required=True)
     parser.add_argument('--timeout', type=float, default=300)
+    parser.add_argument('--device', choices=DEVICES, default='cpu')
     args = parser.parse_args(argv)
     if not args.destination.is_absolute() or not args.environment.is_absolute() or not args.source_checkout.is_absolute():
         parser.error('destination, environment and source checkout must be absolute paths')
@@ -93,11 +96,12 @@ def main(argv=None) -> int:
         with InstalledModel(args.installed_asset, args.content_root,
             maximum_bytes=args.model_snapshot_bytes, provider='kilix-qwen-tts',
             consumer_schema='kilix.qwen-tts.runtime') as model:
-            stage(args.destination, args.environment, args.source_checkout, model, timeout=args.timeout)
+            stage(args.destination, args.environment, args.source_checkout, model, timeout=args.timeout,
+                  device=args.device)
     finally:
         for sig, handler in previous.items():
             signal.signal(sig, handler)
-    print('Receipt-backed CPU runtime staged; release qualification remains required.')
+    print(f'Receipt-backed {args.device} runtime staged; release qualification remains required.')
     return 0
 
 

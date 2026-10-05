@@ -14,8 +14,10 @@ import time
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 from kilix_qwen_tts.runtime import (
-    ENGINE_COMMIT, MODEL_CANDIDATES, RUNTIME_SCHEMA, InstalledRuntime, digest_file, tree_digest,
+    DEVICES, ENGINE_COMMIT, MODEL_CANDIDATES, RUNTIME_SCHEMA, InstalledRuntime, digest_file, tree_digest,
 )
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from build_environment import DEVICE_GROUPS
 
 
 def interpreter_sha256(python: Path, check=lambda: None) -> str:
@@ -65,15 +67,23 @@ def checked_output(command, check=lambda: None, *, deadline=None) -> bytes:
                 raise RuntimeError('probe descendant cleanup did not complete') from error
 
 
-def environment_record(environment_path: Path, source_checkout: Path, check=lambda: None, *, deadline=None) -> dict:
+def environment_record(environment_path: Path, source_checkout: Path, check=lambda: None, *, deadline=None,
+                       device: str = "cpu") -> dict:
     """Bind the same owned interpreter, dependency tree and exact engine sources."""
     check()
+    if device not in DEVICES:
+        raise ValueError('unsupported runtime device')
     def probe(command):
         return checked_output(command, check, deadline=deadline)
     revision = probe(['git', '-C', str(source_checkout), 'rev-parse', 'HEAD']).decode().strip()
     if revision != ENGINE_COMMIT:
         raise ValueError('source checkout does not match the pinned engine')
     python = environment_path.absolute() / "bin/python"
+    # A runtime's device names the torch build its environment carries.
+    build = probe([str(python), "-I", "-B", "-c",
+                   "import importlib.metadata as m; print(m.version('torch'))"]).decode().strip()
+    if build != DEVICE_GROUPS[device][1]:
+        raise ValueError('environment torch build does not match the runtime device')
     # -I avoids inherited startup paths; -B preserves the bound environment.
     site = Path(probe([str(python), "-I", "-B", "-c",
                       "import sysconfig; print(sysconfig.get_path('purelib'))"]).decode().strip())
@@ -106,6 +116,7 @@ def main():
     parser.add_argument("--environment", type=Path, required=True)
     parser.add_argument("--source-checkout", type=Path, required=True)
     parser.add_argument("--model-id", choices=tuple(MODEL_CANDIDATES), required=True)
+    parser.add_argument("--device", choices=DEVICES, default="cpu")
     args = parser.parse_args()
     destination = args.destination.absolute()
     if destination.exists() or destination.is_symlink():
@@ -116,7 +127,7 @@ def main():
     record = json.loads(args.artifact_record.read_text())
     if record["revision"] != MODEL_CANDIDATES[args.model_id][0]:
         parser.error("artifact record has a different revision")
-    environment = environment_record(args.environment, args.source_checkout)
+    environment = environment_record(args.environment, args.source_checkout, device=args.device)
     destination.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
     with tempfile.TemporaryDirectory(prefix=".qwen-stage-", dir=destination.parent) as temporary:
         root = Path(temporary) / "runtime"
@@ -133,7 +144,7 @@ def main():
             if target.stat().st_size != item["bytes"] or digest_file(target) != item["sha256"]:
                 parser.error("model artifact bytes do not match the record")
             files[str(target.relative_to(root))] = item["sha256"]
-        value = {"schema": RUNTIME_SCHEMA, "engine_revision": ENGINE_COMMIT, "device": "cpu",
+        value = {"schema": RUNTIME_SCHEMA, "engine_revision": ENGINE_COMMIT, "device": args.device,
                  "model": {"id": args.model_id, "revision": record["revision"]},
                  "files": files, "environment": environment}
         (root / "runtime.json").write_text(json.dumps(value, indent=2) + "\n")
@@ -146,7 +157,7 @@ def main():
         except BaseException:
             shutil.rmtree(destination)
             raise
-    print("Development CPU runtime staged; release qualification remains required.")
+    print(f"Development {args.device} runtime staged; release qualification remains required.")
 
 
 if __name__ == "__main__":

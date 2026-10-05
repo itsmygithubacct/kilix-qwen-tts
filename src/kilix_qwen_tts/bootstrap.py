@@ -16,6 +16,11 @@ import sys
 
 MAX_FILES = 40_000
 MAX_BYTES = 7 * 1024**3
+# (bundle bytes, files, memory ceiling). CUDA initialisation reserves far
+# more virtual address space than it backs, so the CUDA profile bounds
+# private writable data (RLIMIT_DATA) instead of address space (RLIMIT_AS).
+PROFILES = {"cpu": (MAX_BYTES, MAX_FILES, 20 * 1024**3),
+            "cuda": (14 * 1024**3, 60_000, 24 * 1024**3)}
 MAGIC = b"KQRT\x01"
 RECORD = struct.Struct("!HQB")
 
@@ -27,10 +32,10 @@ def exact(source, size):
     return value
 
 
-def unpack(descriptor):
+def unpack(descriptor, max_bytes=MAX_BYTES, max_files=MAX_FILES):
     if fcntl.fcntl(descriptor, 1034) & 15 != 15:
         raise ValueError("unsealed runtime bundle")
-    if os.fstat(descriptor).st_size > MAX_BYTES + MAX_FILES * (4096 + RECORD.size) + 32:
+    if os.fstat(descriptor).st_size > max_bytes + max_files * (4096 + RECORD.size) + 32:
         raise ValueError("oversized runtime bundle")
     count = total = 0
     with os.fdopen(descriptor, "rb") as source:
@@ -52,7 +57,7 @@ def unpack(descriptor):
                 raise ValueError("unsafe runtime bundle path")
             count += 1
             total += size
-            if count > MAX_FILES or total > MAX_BYTES:
+            if count > max_files or total > max_bytes:
                 raise ValueError("runtime bundle exceeds its bound")
             destination = Path("/opt") / relative
             destination.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
@@ -64,14 +69,23 @@ def unpack(descriptor):
                     size -= len(data)
 
 
-def prepare_mount():
+def limits(profile):
+    """Hard ceilings for the staged interpreter, chosen by the trusted host."""
+    memory = PROFILES[profile][2]
+    return {resource.RLIMIT_CORE: 0,
+            resource.RLIMIT_DATA if profile == "cuda" else resource.RLIMIT_AS: memory,
+            resource.RLIMIT_CPU: 3600, resource.RLIMIT_FSIZE: 64 * 1024**2,
+            resource.RLIMIT_NOFILE: 128}
+
+
+def prepare_mount(max_bytes=MAX_BYTES):
     libc = ctypes.CDLL(None, use_errno=True)
     libc.mount.argtypes = [ctypes.c_char_p, ctypes.c_char_p, ctypes.c_char_p, ctypes.c_ulong, ctypes.c_void_p]
     # bwrap's setup mount namespace belongs to its earlier user namespace.
     # Own a new mount namespace and a new tmpfs with no writable outer alias.
     if libc.unshare(0x20000) != 0:  # CLONE_NEWNS
         raise OSError(ctypes.get_errno(), "cannot own runtime mount namespace")
-    if libc.mount(b"tmpfs", b"/opt", b"tmpfs", 6, f"size={MAX_BYTES + 64 * 1024**2},mode=0700".encode()) != 0:
+    if libc.mount(b"tmpfs", b"/opt", b"tmpfs", 6, f"size={max_bytes + 64 * 1024**2},mode=0700".encode()) != 0:
         raise OSError(ctypes.get_errno(), "cannot allocate private runtime filesystem")
     return libc
 
@@ -94,19 +108,19 @@ def seal_mount_and_drop_capabilities(libc):
 
 
 def main():
-    if len(sys.argv) != 2 or not sys.argv[1].isdigit() or int(sys.argv[1]) < 3:
+    if (len(sys.argv) not in (2, 3) or not sys.argv[1].isdigit() or int(sys.argv[1]) < 3
+            or len(sys.argv) == 3 and sys.argv[2] not in PROFILES):
         return 125
-    libc = prepare_mount()
-    unpack(int(sys.argv[1]))
+    profile = sys.argv[2] if len(sys.argv) == 3 else "cpu"
+    max_bytes, max_files, _address_space = PROFILES[profile]
+    libc = prepare_mount(max_bytes)
+    unpack(int(sys.argv[1]), max_bytes, max_files)
     seal_mount_and_drop_capabilities(libc)
     # Set hard ceilings in the trusted system interpreter, before the staged
     # interpreter or any site/dependency startup code can execute. Extraction
     # above has its own file/population/tmpfs bounds and needs larger files.
-    resource.setrlimit(resource.RLIMIT_CORE, (0, 0))
-    resource.setrlimit(resource.RLIMIT_AS, (20 * 1024**3, 20 * 1024**3))
-    resource.setrlimit(resource.RLIMIT_CPU, (3600, 3600))
-    resource.setrlimit(resource.RLIMIT_FSIZE, (64 * 1024**2, 64 * 1024**2))
-    resource.setrlimit(resource.RLIMIT_NOFILE, (128, 128))
+    for kind, value in limits(profile).items():
+        resource.setrlimit(kind, (value, value))
     executable = "/opt/python/bin/python3.12"
     os.execv(executable, [executable, "-I", "-B", "/opt/provider/kilix_qwen_tts/supervisor.py"])
     return 125

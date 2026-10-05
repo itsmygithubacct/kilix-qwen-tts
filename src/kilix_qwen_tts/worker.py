@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from contextlib import nullcontext
 import hashlib
 import json
 import os
@@ -22,19 +23,46 @@ def _offline(event: str, _arguments: tuple) -> None:
         raise PermissionError("network access is disabled in the speech worker")
 
 
+def _generate_cached_clone(model, options, audio, cached, workspace, torch):
+    """x-vector prompt cache; the stored embedding is float32 on every device."""
+    from qwen_tts import VoiceClonePromptItem
+    from kilix_qwen_tts.prompt_cache import DIMENSIONS, ENCODING, MAGIC, read_embedding, validate_embedding
+    if model.model.config.speaker_encoder_config.enc_dim != DIMENSIONS:
+        raise ValueError("unsupported speaker embedding shape")
+    if cached:
+        saved = read_embedding("/opt/prompt.embedding", readonly_mount=True)
+        embedding = torch.tensor(ENCODING.unpack(saved[len(MAGIC):]), dtype=torch.float32, device="cpu")
+    else:
+        with torch.random.fork_rng(devices=[]):
+            produced = model.create_voice_clone_prompt(ref_audio=audio, x_vector_only_mode=True)
+        if (len(produced) != 1 or produced[0].ref_code is not None
+                or produced[0].x_vector_only_mode is not True or produced[0].icl_mode is not False
+                or produced[0].ref_text is not None):
+            raise ValueError("invalid cached prompt shape")
+        # The engine moves the embedding to the talker's device and dtype.
+        embedding = produced[0].ref_spk_embedding.detach().to(device="cpu", dtype=torch.float32)
+    if (tuple(embedding.shape) != (DIMENSIONS,) or embedding.dtype != torch.float32
+            or embedding.device.type != "cpu"):
+        raise ValueError("invalid cached prompt shape")
+    items = [VoiceClonePromptItem(None, embedding, True, False, None)]
+    saved = validate_embedding(MAGIC + ENCODING.pack(*embedding.tolist()))
+    (workspace / "prompt.embedding").write_bytes(saved)
+    return model.generate_voice_clone(**options, voice_clone_prompt=items)
+
+
 def main() -> None:
-    resource.setrlimit(resource.RLIMIT_CORE, (0, 0))
-    resource.setrlimit(resource.RLIMIT_AS, (20 * 1024**3, 20 * 1024**3))
-    resource.setrlimit(resource.RLIMIT_CPU, (3600, 3600))
-    resource.setrlimit(resource.RLIMIT_FSIZE, (64 * 1024**2, 64 * 1024**2))
-    resource.setrlimit(resource.RLIMIT_NOFILE, (128, 128))
-    os.umask(0o077)
     request = json.loads(sys.stdin.buffer.read(65_537))
+    from kilix_qwen_tts.bootstrap import limits
+    from kilix_qwen_tts.device import offer
+    profile, offered = offer(request.get("profile", "cpu"), request.get("device", "cpu"))
+    # The same ceilings the trusted bootstrap applied for this profile.
+    for kind, value in limits(profile).items():
+        resource.setrlimit(kind, (value, value))
+    os.umask(0o077)
     streaming = request.get("streaming_pcm", False)
     if type(streaming) is not bool:
         raise ValueError("invalid streaming selection")
     stream = None
-    incremental = None
     if streaming:
         from kilix_qwen_tts.streaming import WorkerStream
         stream = WorkerStream(sys.stdout.buffer)
@@ -57,24 +85,14 @@ def main() -> None:
     import torch
     # Third-party imports/model generation may print status to stdout. The
     # worker reserves stdout for one bounded machine-readable result.
-    from contextlib import ExitStack, redirect_stdout
-    with ExitStack() as resources, redirect_stdout(sys.stderr):
+    from contextlib import redirect_stdout
+    with redirect_stdout(sys.stderr):
         from qwen_tts import Qwen3TTSModel
+        from kilix_qwen_tts import device as devices
         torch.set_num_threads(2)
         torch.set_num_interop_threads(2)
-        torch.manual_seed(args["seed"])
-        model = Qwen3TTSModel.from_pretrained(
-            str(root / "model"), device_map="cpu", dtype=torch.float32,
-            attn_implementation="sdpa", local_files_only=True,
-            use_safetensors=True, trust_remote_code=False,
-        )
-        if stream is not None:
-            from kilix_qwen_tts.codec_stream import IncrementalCodes
-            incremental = resources.enter_context(IncrementalCodes(model, stream.pcm, args["max_duration_ms"]))
         language = LANGUAGES[args["language"].lower().split("-")[0]]
-        options = {"text": args["text"], "language": language,
-                   "non_streaming_mode": True,
-                   "max_new_tokens": max(1, args["max_duration_ms"] // 80)}
+        prompt_audio = None
         conditioning = None
         if args["mode"] == "prompt_clone":
             descriptor = os.open("/opt/prompt.pcm", os.O_RDONLY | os.O_CLOEXEC)
@@ -85,49 +103,62 @@ def main() -> None:
                     or hashlib.sha256(payload).hexdigest() != prompt["sha256"]):
                 raise ValueError("prompt digest mismatch")
             dtype = "<i2" if prompt["sample_format"] == "s16le" else "<f4"
-            audio = np.frombuffer(payload, dtype=dtype).astype(np.float32)
+            prompt_audio = np.frombuffer(payload, dtype=dtype).astype(np.float32)
             if dtype == "<i2":
-                audio /= 32768.0
-            if not np.isfinite(audio).all():
+                prompt_audio /= 32768.0
+            if not np.isfinite(prompt_audio).all():
                 raise ValueError("non-finite prompt samples")
             consent = json.dumps(args["consent"], separators=(",", ":"), sort_keys=True).encode()
             conditioning = {"prompt_sha256": prompt["sha256"],
                             "consent_sha256": hashlib.sha256(consent).hexdigest()}
-            if cache:
-                from qwen_tts import VoiceClonePromptItem
-                from kilix_qwen_tts.prompt_cache import DIMENSIONS, ENCODING, MAGIC, read_embedding, validate_embedding
-                if model.model.config.speaker_encoder_config.enc_dim != DIMENSIONS:
-                    raise ValueError("unsupported speaker embedding shape")
-                if cached:
-                    saved = read_embedding("/opt/prompt.embedding", readonly_mount=True)
-                    embedding = torch.tensor(ENCODING.unpack(saved[len(MAGIC):]), dtype=torch.float32, device="cpu")
-                    items = [VoiceClonePromptItem(None, embedding, True, False, None)]
-                else:
-                    with torch.random.fork_rng(devices=[]):
-                        items = model.create_voice_clone_prompt(ref_audio=(audio, prompt["sample_rate_hz"]), x_vector_only_mode=True)
-                if (len(items) != 1 or tuple(items[0].ref_spk_embedding.shape) != (DIMENSIONS,)
-                        or items[0].ref_spk_embedding.dtype != torch.float32 or items[0].ref_spk_embedding.device.type != "cpu"
-                        or items[0].ref_code is not None or items[0].x_vector_only_mode is not True
-                        or items[0].icl_mode is not False or items[0].ref_text is not None):
-                    raise ValueError("invalid cached prompt shape")
-                saved = validate_embedding(MAGIC + ENCODING.pack(*items[0].ref_spk_embedding.detach().tolist()))
-                (workspace / "prompt.embedding").write_bytes(saved)
-                waves, sample_rate = model.generate_voice_clone(**options, voice_clone_prompt=items)
-            else:
-                waves, sample_rate = model.generate_voice_clone(
-                    **options, ref_audio=(audio, prompt["sample_rate_hz"]), x_vector_only_mode=True,
-                )
-        elif args["mode"] == "named_voice":
-            waves, sample_rate = model.generate_custom_voice(
-                **options, speaker=args["voice_id"], instruct=args.get("instruction", ""),
+        emitted = []
+
+        def emit(pcm):
+            emitted.append(True)
+            stream.pcm(pcm)
+
+        def load(device, dtype):
+            return Qwen3TTSModel.from_pretrained(
+                str(root / "model"), device_map="cuda:0" if device == "cuda" else "cpu",
+                dtype=dtype, attn_implementation="sdpa", local_files_only=True,
+                use_safetensors=True, trust_remote_code=False,
             )
-        elif args["mode"] == "voice_design":
-            instruction = args["description"]
-            if args.get("instruction"):
-                instruction += "\n" + args["instruction"]
-            waves, sample_rate = model.generate_voice_design(**options, instruct=instruction)
-        else:
-            raise ValueError("unsupported synthesis mode")
+
+        def generate(model, device):
+            # Every attempt starts from the job seed, so a CPU retry is the
+            # same computation as a CPU-only job.
+            torch.manual_seed(args["seed"])
+            incremental = None
+            if stream is not None:
+                from kilix_qwen_tts.codec_stream import IncrementalCodes
+                incremental = IncrementalCodes(model, emit, args["max_duration_ms"])
+            options = {"text": args["text"], "language": language,
+                       "non_streaming_mode": True,
+                       "max_new_tokens": max(1, args["max_duration_ms"] // 80)}
+            with incremental if incremental is not None else nullcontext():
+                if args["mode"] == "prompt_clone":
+                    audio = (prompt_audio, args["prompt_audio"]["sample_rate_hz"])
+                    if cache:
+                        waves, rate = _generate_cached_clone(model, options, audio, cached, workspace, torch)
+                    else:
+                        waves, rate = model.generate_voice_clone(
+                            **options, ref_audio=audio, x_vector_only_mode=True,
+                        )
+                elif args["mode"] == "named_voice":
+                    waves, rate = model.generate_custom_voice(
+                        **options, speaker=args["voice_id"], instruct=args.get("instruction", ""),
+                    )
+                elif args["mode"] == "voice_design":
+                    instruction = args["description"]
+                    if args.get("instruction"):
+                        instruction += "\n" + args["instruction"]
+                    waves, rate = model.generate_voice_design(**options, instruct=instruction)
+                else:
+                    raise ValueError("unsupported synthesis mode")
+            return waves, rate, incremental
+
+        used, (waves, sample_rate, incremental) = devices.run(
+            offered, torch, load, generate, retry_allowed=lambda: not emitted)
     if len(waves) != 1 or sample_rate != 24000:
         raise ValueError("unexpected engine audio format")
     audio = np.asarray(waves[0])
@@ -149,7 +180,7 @@ def main() -> None:
     else:
         sf.write(destination, audio, sample_rate, format="WAV", subtype="PCM_16")
     payload = destination.read_bytes()
-    result = {"engine_id": "qwen3-tts", "engine_revision": ENGINE_COMMIT,
+    result = {"engine_id": "qwen3-tts", "engine_revision": ENGINE_COMMIT, "device": used,
               "model_id": manifest["model"]["id"], "model_revision": manifest["model"]["revision"],
               "duration_ms": duration_ms, "seed": args["seed"],
               "audio": {"sha256": hashlib.sha256(payload).hexdigest(), "byte_length": len(payload)}}

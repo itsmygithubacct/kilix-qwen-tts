@@ -1,4 +1,4 @@
-"""Incremental decoding for the pinned Qwen 12 Hz CPU codebook model."""
+"""Incremental decoding for the pinned Qwen 12 Hz codebook model on CPU or CUDA."""
 from __future__ import annotations
 
 import io
@@ -21,6 +21,8 @@ class IncrementalCodes:
         self.code_groups = self.decoder.config.num_quantizers
         self.codebook_size = self.decoder.config.codebook_size
         self.eos = model.model.config.talker_config.codec_eos_token_id
+        # Code frames stay on the device that produced them.
+        self.device_type = model.model.talker.device.type
         if (int(self.decoder.total_upsample) != 1920 or self.code_groups != 16
                 or model.model.speech_tokenizer.get_output_sample_rate() != 24_000):
             raise ValueError("unsupported incremental decoder")
@@ -49,7 +51,7 @@ class IncrementalCodes:
             return
         torch = self.torch
         if (not isinstance(codes, torch.Tensor) or tuple(codes.shape) != (1, self.code_groups)
-                or codes.dtype not in (torch.int32, torch.int64) or codes.device.type != "cpu"):
+                or codes.dtype not in (torch.int32, torch.int64) or codes.device.type != self.device_type):
             raise ValueError("unexpected code frame")
         if int(codes[0, 0]) == self.eos:
             self.ended = True
@@ -76,7 +78,8 @@ class IncrementalCodes:
             decoded = self.decoder(codes)
         if tuple(decoded.shape) != (1, 1, len(population) * 1920):
             raise ValueError("unexpected incremental audio shape")
-        audio = decoded[0, 0, len(self.context) * 1920:].detach().cpu().numpy()
+        # A float32 copy, as the engine's own decode returns, on every device.
+        audio = decoded[0, 0, len(self.context) * 1920:].detach().to(torch.float32).cpu().numpy()
         if not np.isfinite(audio).all():
             raise ValueError("non-finite incremental audio")
         container = io.BytesIO()
