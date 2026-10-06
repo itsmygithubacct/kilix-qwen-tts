@@ -32,10 +32,13 @@ def select(offered: str, torch) -> str:
 
 
 def dtype(device: str, torch):
-    """CPU keeps float32; CUDA uses bfloat16 where supported, else float16."""
-    if device == "cpu":
-        return torch.float32
-    return torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
+    """CPU keeps float32; CUDA always uses bfloat16, the checkpoint's dtype.
+
+    float16 overflows in this engine: a 0.6B CustomVoice generation stops
+    with a device-side assert. Pre-Ampere GPUs emulate bfloat16, slower but
+    correct.
+    """
+    return torch.float32 if device == "cpu" else torch.bfloat16
 
 
 def cuda_failure(error: BaseException, torch) -> bool:

@@ -67,8 +67,10 @@ class SelectionTests(unittest.TestCase):
 
     def test_precision_follows_device(self):
         self.assertEqual(device.dtype('cpu', fake_torch()), 'float32')
-        self.assertEqual(device.dtype('cuda', fake_torch()), 'bfloat16')
-        self.assertEqual(device.dtype('cuda', fake_torch(bf16=False)), 'float16')
+        # Emulated bfloat16 on pre-Ampere GPUs still beats float16, which
+        # overflows in this engine.
+        for native in (True, False):
+            self.assertEqual(device.dtype('cuda', fake_torch(bf16=native)), 'bfloat16')
 
     def record(self, failures=()):
         calls = []
