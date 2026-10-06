@@ -14,6 +14,7 @@ import os
 from pathlib import Path
 import stat
 import subprocess
+import sys
 import tempfile
 import threading
 import time
@@ -166,6 +167,7 @@ class InstalledRuntime:
             raise ProtocolError("INVALID_RUNTIME", "invalid runtime interpreter")
         self.device = value["device"]
         self.last_device = None
+        self.cuda_fallbacks = 0
         self.model_id = model["id"]
         self.model_revision = model["revision"]
         self.mode = MODEL_CANDIDATES[self.model_id][1]
@@ -188,9 +190,33 @@ class InstalledRuntime:
                 "engine_id": "qwen3-tts", "engine_revision": ENGINE_COMMIT,
                 "installed": True, "release_qualified": False,
                 "device": getattr(self, "device", "cpu"),
+                "last_device": getattr(self, "last_device", None),
+                "cuda_fallbacks": getattr(self, "cuda_fallbacks", 0),
                 "capabilities": [self.mode], "streaming": True,
                 "asset_authority": ("kilix-content" if self.model_source is not None
                                     else "local-stage")}
+
+
+def device_state(runtime) -> dict:
+    """The device profile and what the last job used, for service status."""
+    return {"profile": getattr(runtime, "device", "cpu"),
+            "last_device": getattr(runtime, "last_device", None),
+            "cuda_fallbacks": getattr(runtime, "cuda_fallbacks", 0)}
+
+
+def record_device(runtime, offered: str, used: str) -> None:
+    """Remember the device a job ran on; say so when a CUDA runtime ran on the CPU.
+
+    A CUDA-profile runtime that silently runs on the CPU reports healthy while
+    it is slow, so the fallback is counted and written to stderr (the service
+    journal) as well as kept in status.
+    """
+    runtime.last_device = used
+    if getattr(runtime, "device", "cpu") == "cuda" and used == "cpu":
+        runtime.cuda_fallbacks = getattr(runtime, "cuda_fallbacks", 0) + 1
+        cause = "the host offered no GPU" if offered == "cpu" else "the worker fell back after a CUDA failure"
+        print(f"KILIX_QWEN_TTS_DEVICE_FALLBACK model={runtime.model_id} profile=cuda "
+              f"offered={offered} used=cpu: {cause}", file=sys.stderr, flush=True)
 
 
 def stop_process(process: subprocess.Popen) -> None:
@@ -350,7 +376,7 @@ def _run_owned_job(runtime, audio_fd, args, *, deadline, cancel, disconnected, o
                 check()
                 on_embedding(read_embedding(Path(workspace) / "prompt.embedding"))
             # The client result contract is unchanged; the device stays local.
-            runtime.last_device = result.pop("device")
+            record_device(runtime, offered, result.pop("device"))
             return result, payload
         finally:
             owner.finish(process, stop_process)

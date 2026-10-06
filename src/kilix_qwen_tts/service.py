@@ -18,7 +18,7 @@ from .protocol import (
     PROTOCOL_SCHEMA, ProtocolError, ProviderRequest, receive_packet,
     require_same_uid_peer, send_packet, verify_request_descriptors,
 )
-from .runtime import InstalledRuntime, MAX_INPUT_BYTES, MODEL_CANDIDATES, private_directory, run_job
+from .runtime import InstalledRuntime, MAX_INPUT_BYTES, MODEL_CANDIDATES, device_state, private_directory, run_job
 
 SOCKET_NAME = "kilix-qwen-tts.sock"
 
@@ -240,7 +240,8 @@ class Service:
                     model_id = self._active_model or self.runtime.model_id
                 result = {"provider_state": "unavailable" if unavailable else "busy" if busy else "ready", "worker_active": busy,
                           "engine_id": "qwen3-tts", "model_id": model_id,
-                          "release_qualified": False}
+                          "release_qualified": False,
+                          "devices": {selected.model_id: device_state(selected) for selected in self.runtimes}}
                 kind = "status"
             elif request.operation == "cancel":
                 with self._mutex:

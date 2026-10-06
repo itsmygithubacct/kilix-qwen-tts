@@ -6,8 +6,10 @@ recorded separately on GPU hardware.
 """
 from __future__ import annotations
 
+import contextlib
 import hashlib
 import importlib.util
+import io
 import json
 import os
 from pathlib import Path
@@ -23,8 +25,10 @@ from unittest.mock import patch
 
 from kilix_qwen_tts import bootstrap, device, sandbox
 from kilix_qwen_tts.protocol import ProtocolError
-from kilix_qwen_tts.runtime import (ENGINE_COMMIT, RUNTIME_SCHEMA, InstalledRuntime, digest_file,
+from kilix_qwen_tts.runtime import (ENGINE_COMMIT, RUNTIME_SCHEMA, InstalledRuntime, device_state, digest_file,
+                                    record_device,
                                     run_job, tree_digest)
+from kilix_qwen_tts.service import client_request, request_value
 import test_runtime as fixtures
 
 TOOLS = Path(__file__).resolve().parents[1] / 'tools'
@@ -215,7 +219,14 @@ class DriverLibraryTests(unittest.TestCase):
             writable.chmod(0o666)
             loop = usr / 'lib/loop.so.1'
             loop.symlink_to(loop)
-            for library in (escape, writable, loop, usr / 'lib/nvidia'):
+            # A chain through an /etc hop may only end at a file under /usr:
+            # a root-owned, well-protected regular file in /etc is no driver.
+            elsewhere = etc / 'alternatives/not-a-driver'
+            elsewhere.write_bytes(b'policy')
+            elsewhere.chmod(0o644)
+            ends_in_etc = usr / 'lib/ends-in-etc.so.1'
+            ends_in_etc.symlink_to(elsewhere)
+            for library in (escape, writable, loop, usr / 'lib/nvidia', ends_in_etc):
                 with self.subTest(library=library.name):
                     self.assertIsNone(self.binds(root, [library]))
             a, b, c, d = self.patched(root, [real])
@@ -323,6 +334,49 @@ class DeviceJobTests(unittest.TestCase):
                 self.run_with(profile, nodes, 'claim-gpu')
             self.assertEqual(caught.exception.code, 'ENGINE_FAILED')
 
+    def fallback_line(self, profile, nodes, text='speech'):
+        stderr = io.StringIO()
+        with contextlib.redirect_stderr(stderr):
+            self.run_with(profile, nodes, text)
+        return stderr.getvalue()
+
+    def test_a_cuda_job_that_ran_on_the_cpu_is_counted_and_logged(self):
+        self.runtime.cuda_fallbacks = 0
+        self.assertEqual(self.fallback_line('cuda', STAND_INS), '')
+        self.assertEqual(device_state(self.runtime),
+                         {'profile': 'cuda', 'last_device': 'cuda', 'cuda_fallbacks': 0})
+        for nodes, text, cause in ((STAND_INS, 'no-gpu', 'worker fell back'), ((), 'speech', 'offered no GPU')):
+            with self.subTest(cause=cause):
+                line = self.fallback_line('cuda', nodes, text)
+                self.assertIn('KILIX_QWEN_TTS_DEVICE_FALLBACK', line)
+                self.assertIn(self.runtime.model_id, line)
+                self.assertIn('used=cpu', line)
+                self.assertIn(cause, line)
+        self.assertEqual(device_state(self.runtime),
+                         {'profile': 'cuda', 'last_device': 'cpu', 'cuda_fallbacks': 2})
+        # A CPU-profile runtime running on the CPU is not a fallback.
+        self.runtime.cuda_fallbacks = 0
+        self.assertEqual(self.fallback_line('cpu', ()), '')
+        self.assertEqual(device_state(self.runtime),
+                         {'profile': 'cpu', 'last_device': 'cpu', 'cuda_fallbacks': 0})
+
+    def test_service_status_shows_the_device_the_last_job_used(self):
+        self.fixture.start()
+        self.runtime.device = 'cuda'
+        self.runtime.last_device = None
+        self.runtime.cuda_fallbacks = 0
+        expected = lambda used, count: {self.runtime.model_id: {
+            'profile': 'cuda', 'last_device': used, 'cuda_fallbacks': count}}
+        self.assertEqual(client_request(self.fixture.ipc, request_value('status'))['devices'],
+                         expected(None, 0))
+        for text, used, count in (('speech', 'cuda', 0), ('no-gpu', 'cpu', 1)):
+            with self.subTest(text=text), patch('kilix_qwen_tts.sandbox.accelerator_nodes', return_value=STAND_INS), \
+                    contextlib.redirect_stderr(io.StringIO()), self.fixture.audio.open('rb') as source:
+                client_request(self.fixture.ipc, request_value(
+                    'submit', job_id='device-' + used, args=self.fixture.arguments(text), timeout=10), source.fileno())
+                self.assertEqual(client_request(self.fixture.ipc, request_value('status'))['devices'],
+                                 expected(used, count))
+
     def test_cuda_profile_admits_a_population_the_cpu_profile_refuses(self):
         for index in range(30):
             (self.runtime.site_packages / f'extra-{index}').write_bytes(b'')
@@ -373,6 +427,12 @@ class ManifestTests(unittest.TestCase):
                 self.assertEqual(runtime.device, value)
                 self.assertEqual(runtime.model_record()['device'], value)
                 self.assertEqual(runtime.mode, 'voice_design')
+                self.assertIsNone(runtime.model_record()['last_device'])
+                self.assertEqual(runtime.model_record()['cuda_fallbacks'], 0)
+                with contextlib.redirect_stderr(io.StringIO()):
+                    record_device(runtime, 'cpu', 'cpu')
+                self.assertEqual(runtime.model_record()['last_device'], 'cpu')
+                self.assertEqual(runtime.model_record()['cuda_fallbacks'], 1 if value == 'cuda' else 0)
         for value in ('gpu', 'rocm', 'cuda:0', None, ['cuda']):
             with self.subTest(value=value), tempfile.TemporaryDirectory() as tmp, \
                     self.assertRaises(ProtocolError):
