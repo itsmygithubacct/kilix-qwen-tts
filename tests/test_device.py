@@ -438,6 +438,20 @@ class ManifestTests(unittest.TestCase):
                     self.assertRaises(ProtocolError):
                 self.manifest_runtime(Path(tmp), value)
 
+    def test_a_broken_stderr_does_not_fail_a_job_that_fell_back(self):
+        # The job already succeeded; the fallback is kept in status. Writing
+        # the journal line to a closed or broken stderr must not raise.
+        class Broken(io.StringIO):
+            def write(self, _text):
+                raise BrokenPipeError(32, 'Broken pipe')
+
+        with tempfile.TemporaryDirectory() as tmp:
+            runtime = self.manifest_runtime(Path(tmp), 'cuda')
+            with contextlib.redirect_stderr(Broken()):
+                record_device(runtime, 'cuda', 'cpu')
+            self.assertEqual(runtime.model_record()['last_device'], 'cpu')
+            self.assertEqual(runtime.model_record()['cuda_fallbacks'], 1)
+
 
 def load_tool(name):
     sys.path.insert(0, str(TOOLS))

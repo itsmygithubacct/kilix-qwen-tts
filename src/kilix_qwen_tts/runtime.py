@@ -215,8 +215,13 @@ def record_device(runtime, offered: str, used: str) -> None:
     if getattr(runtime, "device", "cpu") == "cuda" and used == "cpu":
         runtime.cuda_fallbacks = getattr(runtime, "cuda_fallbacks", 0) + 1
         cause = "the host offered no GPU" if offered == "cpu" else "the worker fell back after a CUDA failure"
-        print(f"KILIX_QWEN_TTS_DEVICE_FALLBACK model={runtime.model_id} profile=cuda "
-              f"offered={offered} used=cpu: {cause}", file=sys.stderr, flush=True)
+        try:
+            print(f"KILIX_QWEN_TTS_DEVICE_FALLBACK model={runtime.model_id} profile=cuda "
+                  f"offered={offered} used=cpu: {cause}", file=sys.stderr, flush=True)
+        except (OSError, ValueError):
+            # The job already succeeded and the fallback is kept in status; a
+            # closed or broken stderr must not turn that success into a failure.
+            pass
 
 
 def stop_process(process: subprocess.Popen) -> None:
