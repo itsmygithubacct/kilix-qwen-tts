@@ -5,8 +5,10 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import os
 from pathlib import Path
 import shutil
+import stat
 import subprocess
 import sys
 import tempfile
@@ -67,6 +69,26 @@ def checked_output(command, check=lambda: None, *, deadline=None) -> bytes:
                 raise RuntimeError('probe descendant cleanup did not complete') from error
 
 
+def require_private_closure(python_root: Path, version: str) -> None:
+    """Refuse a system interpreter closure before any population is hashed.
+
+    Every interpreter file is snapshotted into the job bundle, so the closure
+    must be a desktop-user-owned Python 3.12 tree such as the managed CPython
+    3.12.8 that tools/build_environment.py uses. A root-owned prefix such as
+    /usr would also be walked in full before its first file refused.
+    """
+    if version != "3.12":
+        raise ValueError(f"environment interpreter is Python {version}; the runtime bundle requires 3.12")
+    try:
+        info = python_root.lstat()
+    except OSError as error:
+        raise ValueError("environment interpreter prefix is unavailable") from error
+    if (not python_root.is_absolute() or not stat.S_ISDIR(info.st_mode)
+            or info.st_uid != os.geteuid() or info.st_mode & 0o022):
+        raise ValueError("environment interpreter prefix is not a private user-owned closure; "
+                         "system interpreters are not supported, build with tools/build_environment.py")
+
+
 def environment_record(environment_path: Path, source_checkout: Path, check=lambda: None, *, deadline=None,
                        device: str = "cpu") -> dict:
     """Bind the same owned interpreter, dependency tree and exact engine sources."""
@@ -79,16 +101,19 @@ def environment_record(environment_path: Path, source_checkout: Path, check=lamb
     if revision != ENGINE_COMMIT:
         raise ValueError('source checkout does not match the pinned engine')
     python = environment_path.absolute() / "bin/python"
-    # A runtime's device names the torch build its environment carries.
-    build = probe([str(python), "-I", "-B", "-c",
-                   "import importlib.metadata as m; print(m.version('torch'))"]).decode().strip()
-    if build != DEVICE_GROUPS[device][1]:
-        raise ValueError('environment torch build does not match the runtime device')
     # -I avoids inherited startup paths; -B preserves the bound environment.
     site = Path(probe([str(python), "-I", "-B", "-c",
                       "import sysconfig; print(sysconfig.get_path('purelib'))"]).decode().strip())
     python_root = Path(probe([str(python), "-I", "-B", "-c",
                              "import sys; print(sys.base_prefix)"]).decode().strip())
+    version = probe([str(python), "-I", "-B", "-c",
+                     "import sys; print('%d.%d' % sys.version_info[:2])"]).decode().strip()
+    require_private_closure(python_root, version)
+    # A runtime's device names the torch build its environment carries.
+    build = probe([str(python), "-I", "-B", "-c",
+                   "import importlib.metadata as m; print(m.version('torch'))"]).decode().strip()
+    if build != DEVICE_GROUPS[device][1]:
+        raise ValueError('environment torch build does not match the runtime device')
     tracked = probe(["git", "-C", str(source_checkout), "ls-tree", "-rz",
                      "--name-only", ENGINE_COMMIT, "qwen_tts"]).decode().split("\0")
     sources = {name for name in tracked if name.endswith(".py")}

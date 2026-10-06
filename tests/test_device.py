@@ -322,13 +322,19 @@ def load_tool(name):
 class StagingDeviceTests(unittest.TestCase):
     def test_environment_torch_build_must_match_the_runtime_device(self):
         stage_runtime = load_tool('stage_runtime')
+        private = Path(self.enterContext(tempfile.TemporaryDirectory()))
         def fake(build):
             def checked_output(command, check=lambda: None, *, deadline=None):
+                text = ' '.join(command)
                 if command[:2] == ['git', '-C'] and 'rev-parse' in command:
                     return ENGINE_COMMIT.encode() + b'\n'
-                if any('m.version' in part for part in command):
+                if 'm.version' in text:
                     return build.encode() + b'\n'
-                raise LookupError('reached the environment population probe')
+                if 'purelib' in text or 'base_prefix' in text:
+                    return str(private).encode()
+                if 'version_info' in text:
+                    return b'3.12'
+                raise LookupError('reached the engine source parity probe')
             return checked_output
         for device_value, build in (('cpu', '2.6.0+cpu'), ('cuda', '2.6.0+cu124')):
             with self.subTest(device=device_value), \
@@ -357,6 +363,57 @@ python.write_text(PYTHON_SOURCE)
 python.chmod(0o700)
 with open(os.environ['FAKE_LOG'],'a') as log:log.write(' '.join(sys.argv[1:])+chr(10))
 '''
+
+
+class ClosureTests(unittest.TestCase):
+    """The interpreter-closure seam: system or wrong-version interpreters refuse early."""
+    def probe_outputs(self, root, version, *, hashed):
+        stage_runtime = load_tool('stage_runtime')
+        site = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        def checked_output(command, check=lambda: None, *, deadline=None):
+            text = ' '.join(command)
+            if 'rev-parse' in command:
+                return ENGINE_COMMIT.encode()
+            if 'm.version' in text:
+                return b'2.6.0+cpu'
+            if 'purelib' in text:
+                return str(site).encode()
+            if 'base_prefix' in text:
+                return str(root).encode()
+            if 'version_info' in text:
+                return version.encode()
+            raise LookupError('reached the engine source parity probe')
+        with patch.object(stage_runtime, 'checked_output', checked_output), \
+                patch.object(stage_runtime, 'tree_digest', side_effect=hashed):
+            return stage_runtime.environment_record(Path('/env'), Path('/src'))
+
+    def test_system_or_shared_prefix_refuses_before_any_hashing(self):
+        hashed = AssertionError('hashed a refused closure')
+        for root, version in ((Path('/usr'), '3.12'), (Path('/usr'), '3.13')):
+            with self.subTest(root=root, version=version), self.assertRaises(ValueError):
+                self.probe_outputs(root, version, hashed=hashed)
+        with tempfile.TemporaryDirectory() as tmp:
+            shared = Path(tmp) / 'shared'
+            shared.mkdir(mode=0o700)
+            shared.chmod(0o775)
+            with self.assertRaises(ValueError):
+                self.probe_outputs(shared, '3.12', hashed=hashed)
+
+    def test_wrong_interpreter_version_refuses(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            private = Path(tmp) / 'python'
+            private.mkdir(mode=0o700)
+            for version in ('3.13', '3.11'):
+                with self.subTest(version=version), self.assertRaises(ValueError) as caught:
+                    self.probe_outputs(private, version, hashed=AssertionError('hashed'))
+                self.assertIn('3.12', str(caught.exception))
+
+    def test_private_312_closure_proceeds_to_source_parity(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            private = Path(tmp) / 'python'
+            private.mkdir(mode=0o700)
+            with self.assertRaises(LookupError):
+                self.probe_outputs(private, '3.12', hashed=AssertionError('hashed'))
 
 
 class BuildDeviceTests(unittest.TestCase):

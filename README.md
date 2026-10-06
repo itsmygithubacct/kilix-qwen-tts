@@ -59,6 +59,10 @@ PYTHONPATH=src python3 -m kilix_qwen_tts serve --runtime-root /absolute/private/
 The artifact record contains `revision` and `files` entries with relative
 `path`, `bytes`, and `sha256`. Staging verifies installed Qwen source against
 pinned Git objects and records the complete interpreter/dependency population.
+The interpreter must be a desktop-user-owned Python 3.12 tree, such as the
+managed CPython 3.12.8 the builder uses; a system interpreter (for example a
+venv whose `sys.base_prefix` is `/usr`) or another Python version refuses
+before any population is hashed.
 It downloads nothing. Its `kilix.qwen-tts.runtime/v1` manifest is a development
 byte binding, **not an F100 install/license receipt**.
 
