@@ -126,12 +126,15 @@ class NodeTests(unittest.TestCase):
             for state in states:
                 state.write_text('live\n')
             with patch.object(sandbox, 'GPU_NODES', ('/dev/null', '/dev/zero', '/dev/full')), \
-                    patch.object(sandbox, 'GPU_SYSFS', tuple(map(str, states))):
+                    patch.object(sandbox, 'GPU_SYSFS', tuple(map(str, states))), \
+                    patch.object(sandbox, 'driver_binds', return_value=()):
                 self.assertEqual(len(sandbox.accelerator_nodes()), 3)
+                with patch.object(sandbox, 'driver_binds', return_value=None):
+                    self.assertEqual(sandbox.accelerator_nodes(), ())
                 states[1].unlink()
                 self.assertEqual(sandbox.accelerator_nodes(), ())
         with patch.object(sandbox, 'GPU_NODES', ('/dev/null', '/dev/zero', '/dev/full')), \
-                patch.object(sandbox, 'GPU_SYSFS', ()):
+                patch.object(sandbox, 'GPU_SYSFS', ()), patch.object(sandbox, 'driver_binds', return_value=()):
             self.assertEqual(sandbox.accelerator_nodes(),
                              (('/dev/null', '/dev/null'), ('/dev/zero', '/dev/zero'), ('/dev/full', '/dev/full')))
         with tempfile.TemporaryDirectory() as tmp:
@@ -159,6 +162,67 @@ class NodeTests(unittest.TestCase):
                         self.fail('unsafe accelerator nodes were accepted')
 
 
+class DriverLibraryTests(unittest.TestCase):
+    """Debian routes libcuda through /etc/alternatives; other layouts do not."""
+    def layout(self, root):
+        usr, etc = root / 'usr', root / 'etc'
+        (usr / 'lib/nvidia').mkdir(parents=True)
+        (etc / 'alternatives').mkdir(parents=True)
+        real = usr / 'lib/nvidia/libcuda.so.550'
+        real.write_bytes(b'driver')
+        real.chmod(0o644)
+        return usr, etc, real
+
+    def patched(self, root, libraries):
+        return (patch.object(sandbox, 'DRIVER_ROOT', str(root / 'usr') + '/'),
+                patch.object(sandbox, 'HOP_ROOT', str(root / 'etc') + '/'),
+                patch.object(sandbox, 'TRUSTED_UID', os.geteuid()),
+                patch.object(sandbox, 'DRIVER_LIBRARIES', tuple(map(str, libraries))))
+
+    def binds(self, root, libraries):
+        a, b, c, d = self.patched(root, libraries)
+        with a, b, c, d:
+            return sandbox.driver_binds()
+
+    def test_alternatives_hops_are_bound_and_direct_links_need_none(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            usr, etc, real = self.layout(root)
+            alternative = etc / 'alternatives/nvidia--libcuda.so.1'
+            alternative.symlink_to(real)
+            debian = usr / 'lib/libcuda.so.1'
+            debian.symlink_to(alternative)
+            direct = usr / 'lib/libcuda-direct.so.1'
+            direct.symlink_to('nvidia/libcuda.so.550')
+            self.assertEqual(self.binds(root, [debian]), (str(alternative),))
+            self.assertEqual(self.binds(root, [direct]), ())
+            # The optional JIT library adds its hops when present, and is
+            # skipped when absent; libcuda itself is required.
+            self.assertEqual(self.binds(root, [direct, usr / 'lib/absent.so.1']), ())
+            self.assertEqual(self.binds(root, [direct, debian]), (str(alternative),))
+            self.assertIsNone(self.binds(root, [usr / 'lib/absent.so.1', direct]))
+
+    def test_unsafe_driver_chains_refuse(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            usr, etc, real = self.layout(root)
+            outside = root / 'home-library.so'
+            outside.write_bytes(b'user')
+            escape = usr / 'lib/escape.so.1'
+            escape.symlink_to(outside)
+            writable = usr / 'lib/nvidia/writable.so'
+            writable.write_bytes(b'driver')
+            writable.chmod(0o666)
+            loop = usr / 'lib/loop.so.1'
+            loop.symlink_to(loop)
+            for library in (escape, writable, loop, usr / 'lib/nvidia'):
+                with self.subTest(library=library.name):
+                    self.assertIsNone(self.binds(root, [library]))
+            a, b, c, d = self.patched(root, [real])
+            with a, b, d:  # a regular user-owned file is not a trusted driver
+                self.assertIsNone(sandbox.driver_binds())
+
+
 class CommandTests(unittest.TestCase):
     def bwrap_command(self, runtime, nodes):
         with tempfile.TemporaryDirectory() as tmp:
@@ -176,12 +240,17 @@ class CommandTests(unittest.TestCase):
                 return json.loads(os.pread(configuration, 65536, 0))['command']
 
     def test_sysfs_module_states_are_bound_only_for_a_gpu_job(self):
-        gpu = self.bwrap_command(SimpleNamespace(device='cuda'), STAND_INS)
+        hop = '/etc/alternatives/nvidia--libcuda.so.1-x86_64-linux-gnu'
+        with patch.object(sandbox, 'driver_binds', return_value=(hop,)):
+            gpu = self.bwrap_command(SimpleNamespace(device='cuda'), STAND_INS)
+            cpu = self.bwrap_command(SimpleNamespace(device='cpu'), ())
         binds = [gpu[i + 1:i + 3] for i, word in enumerate(gpu) if word == '--ro-bind-try']
-        self.assertEqual(binds, [[path, path] for path in sandbox.GPU_SYSFS])
+        self.assertEqual(binds, [[path, path] for path in sandbox.GPU_SYSFS] + [[hop, hop]])
+        self.assertNotIn(hop, cpu)
         self.assertEqual([gpu[i + 1:i + 3] for i, word in enumerate(gpu) if word == '--dev-bind'],
                          [list(pair) for pair in STAND_INS])
-        self.assertFalse(any(word.startswith('/sys') and word not in sandbox.GPU_SYSFS for word in gpu))
+        self.assertFalse(any(word.startswith(('/sys', '/etc')) and word not in (*sandbox.GPU_SYSFS, hop)
+                             for word in gpu))
         self.assertEqual(gpu[-1], 'cuda')
         for runtime in (SimpleNamespace(device='cuda'), SimpleNamespace(device='cpu')):
             command = self.bwrap_command(runtime, ())

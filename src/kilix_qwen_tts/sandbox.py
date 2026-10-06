@@ -25,6 +25,15 @@ GPU_NODES = ("/dev/nvidiactl", "/dev/nvidia-uvm", "/dev/nvidia0")
 # CUDA initialisation refuses (error 304) unless both kernel modules report
 # their state; the worker sees these two read-only files and no other sysfs.
 GPU_SYSFS = ("/sys/module/nvidia/initstate", "/sys/module/nvidia_uvm/initstate")
+# The driver's user-space libraries are found below the read-only /usr bind.
+# Distribution packaging (Debian's alternatives) may route them through
+# /etc, which the namespace otherwise lacks: each such hop is bound read-only.
+# libcuda is required; the PTX JIT compiler is bound when present.
+DRIVER_LIBRARIES = ("/usr/lib/x86_64-linux-gnu/libcuda.so.1",
+                    "/usr/lib/x86_64-linux-gnu/libnvidia-ptxjitcompiler.so.1")
+DRIVER_ROOT = "/usr/"
+HOP_ROOT = "/etc/"
+TRUSTED_UID = 0
 BUNDLE_MAGIC = b"KQRT\x01"
 RECORD = struct.Struct("!HQB")
 
@@ -36,10 +45,47 @@ def _character_device(path) -> bool:
         return False
 
 
+def _driver_hops(path):
+    """The /etc symlink hops from a driver library to a root-owned /usr file."""
+    hops = []
+    for _ in range(8):
+        try:
+            info = os.lstat(path)
+        except OSError:
+            return None
+        if stat.S_ISLNK(info.st_mode):
+            target = os.path.normpath(os.path.join(os.path.dirname(path), os.readlink(path)))
+            if not target.startswith((DRIVER_ROOT, HOP_ROOT)):
+                return None
+            if target.startswith(HOP_ROOT):
+                hops.append(target)
+            path = target
+            continue
+        if (stat.S_ISREG(info.st_mode) and path.startswith(DRIVER_ROOT)
+                and info.st_uid == TRUSTED_UID and not info.st_mode & 0o022):
+            return tuple(hops)
+        return None
+    return None
+
+
+def driver_binds():
+    """Read-only /etc hops the driver libraries need, or None without libcuda."""
+    binds = []
+    for index, library in enumerate(DRIVER_LIBRARIES):
+        hops = _driver_hops(library)
+        if hops is None:
+            if index == 0:
+                return None
+            continue
+        binds += [hop for hop in hops if hop not in binds]
+    return tuple(binds)
+
+
 def accelerator_nodes():
     """(host, sandbox) GPU 0 node pairs, only when every required node exists."""
     if (not all(_character_device(path) for path in GPU_NODES)
-            or not all(os.path.isfile(path) for path in GPU_SYSFS)):
+            or not all(os.path.isfile(path) for path in GPU_SYSFS)
+            or driver_binds() is None):
         return ()
     return tuple((path, path) for path in GPU_NODES)
 
@@ -208,6 +254,10 @@ def launch(runtime, workspace: str, audio_fd: int | None, check, *, prompt_embed
         if gpu_nodes:
             for path in GPU_SYSFS:
                 command += ["--ro-bind-try", path, path]
+            # Re-resolved here; a driver change since the offer only means
+            # the worker cannot initialise CUDA and runs on the CPU.
+            for hop in driver_binds() or ():
+                command += ["--ro-bind-try", hop, hop]
         command += ["--tmpfs", "/tmp", "--dir", "/opt",
                     "--bind", workspace, "/job", "--chdir", "/job",
                     "--ro-bind-data", str(bootstrap), "/bootstrap.py", "--",

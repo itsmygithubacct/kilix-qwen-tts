@@ -158,7 +158,10 @@ devices and both `/sys/module/nvidia/initstate` and
 `/sys/module/nvidia_uvm/initstate` exist. The namespace then gains exactly
 those three nodes (`--dev-bind`) and those two read-only sysfs files, which
 CUDA initialisation requires; it sees no other device or sysfs entry, and
-`CUDA_VISIBLE_DEVICES=0`. A `cpu` runtime is never offered the GPU.
+`CUDA_VISIBLE_DEVICES=0`. The driver's `libcuda.so.1` must resolve to a
+root-owned file below `/usr`; where distribution packaging routes it through
+`/etc` (Debian's alternatives), exactly those symlink hops are bound
+read-only, and likewise for the optional PTX JIT compiler library. A `cpu` runtime is never offered the GPU.
 
 Inside the job the worker uses CUDA only when torch can initialise it, in
 bfloat16 (emulated, and slower, before Ampere); float16 overflows in this
