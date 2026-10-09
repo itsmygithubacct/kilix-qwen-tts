@@ -300,20 +300,28 @@ class Service:
                         finally:
                             os.close(descriptor)
                 stream_options = {"on_chunk": chunk} if streaming else {}
-                cache_key = None
+                cache_keys = {}
                 produced_embeddings = []
                 if self._prompt_cache is not None and request.arguments["mode"] == "prompt_clone":
-                    from .prompt_cache import peer_scope, prompt_key
-                    cache_key = prompt_key(peer_scope(channel), selected_runtime.manifest, request.arguments)
-                    if cache_key is not None:
-                        stream_options.update(prompt_embedding=self._prompt_cache.get(cache_key),
-                                              on_embedding=produced_embeddings.append)
+                    from .prompt_cache import peer_scope, prompt_key, producers_for_profile
+                    scope = peer_scope(channel)
+                    if scope is not None:
+                        cache_keys = {producer: prompt_key(scope, selected_runtime.manifest, request.arguments, producer)
+                                      for producer in producers_for_profile(getattr(selected_runtime, 'device', 'cpu'))}
+                        inputs = {}
+                        for producer, key in cache_keys.items():
+                            embedding = self._prompt_cache.get(key)
+                            if embedding is not None:
+                                inputs[producer] = embedding
+                        stream_options.update(prompt_embeddings=inputs,
+                                              on_embedding=lambda producer, payload: produced_embeddings.append((producer, payload)))
                 result, payload = run_job(selected_runtime, snapshot, request.arguments,
                                  deadline=deadline, cancel=cancellation,
                                  execution_policy=self.execution_policy, job_id=request.job_id, progress=queued,
                                  disconnected=lambda: self.stopping.is_set() or _closed(channel), **stream_options)
-                if cache_key is not None:
-                    if len(produced_embeddings) != 1:
+                if cache_keys:
+                    if (len(produced_embeddings) != 1
+                            or produced_embeddings[0][0] not in cache_keys):
                         raise ProtocolError("MALFORMED_WORKER_RESULT", "missing speaker embedding")
                 # Canonical audio is returned in one read-only descriptor.
                 with tempfile.TemporaryFile() as writer:
@@ -324,7 +332,7 @@ class Service:
                         metadata = result
                         finish_job()
                         send_job_packet("result", metadata, result_fd)
-                        if cache_key is not None:
+                        if cache_keys:
                             # A finished engine is not a successful terminal.
                             # Never retain an embedding after terminal refusal,
                             # or resurrect it after concurrent unload/stop.
@@ -334,7 +342,8 @@ class Service:
                                         and not self.stopping.is_set()
                                         and not cancellation.is_set()
                                         and time.monotonic() < deadline):
-                                    self._prompt_cache.put(cache_key, produced_embeddings[0])
+                                    producer, embedding = produced_embeddings[0]
+                                    self._prompt_cache.put(cache_keys[producer], embedding)
                     finally:
                         os.close(result_fd)
                 return

@@ -150,7 +150,7 @@ def snapshot(source: Path, check):
 
 
 @contextmanager
-def launch(runtime, workspace: str, audio_fd: int | None, check, *, prompt_embedding=None,
+def launch(runtime, workspace: str, audio_fd: int | None, check, *, prompt_embeddings=None,
            gpu_nodes=()):
     """Verify actual copied bytes, then unpack only that immutable population."""
     profile = getattr(runtime, "device", "cpu")
@@ -231,14 +231,16 @@ def launch(runtime, workspace: str, audio_fd: int | None, check, *, prompt_embed
             add(path, "provider/kilix_qwen_tts/" + path.name)
         if audio_fd is not None:
             add(Path(f"/proc/self/fd/{audio_fd}"), "prompt.pcm")
-        if prompt_embedding is not None:
-            from .prompt_cache import validate_embedding
-            payload = validate_embedding(prompt_embedding)
-            name = b"prompt.embedding"
-            total_bytes += len(payload)
-            if total_bytes > bundle_limit or len(names) >= file_limit:
-                raise ProtocolError("LIMIT_EXCEEDED", "runtime snapshot exceeds its bound")
-            _write(bundle, RECORD.pack(len(name), len(payload), False) + name + payload)
+        if prompt_embeddings is not None:
+            from .prompt_cache import validate_inputs
+            for producer, payload in validate_inputs(prompt_embeddings, profile).items():
+                name = f"prompt.{producer}.embedding"
+                encoded = name.encode('ascii')
+                total_bytes += len(payload)
+                if total_bytes > bundle_limit or len(names) >= file_limit or name in names:
+                    raise ProtocolError("LIMIT_EXCEEDED", "runtime snapshot exceeds its bound")
+                names.add(name)
+                _write(bundle, RECORD.pack(len(encoded), len(payload), False) + encoded + payload)
         _write(bundle, RECORD.pack(0, 0, 0))
         seal(bundle)
         bootstrap, _, _ = snapshot(Path(__file__).with_name("bootstrap.py"), check)

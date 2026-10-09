@@ -23,6 +23,7 @@ PROFILES = {"cpu": (MAX_BYTES, MAX_FILES, 20 * 1024**3),
             "cuda": (14 * 1024**3, 60_000, 24 * 1024**3)}
 MAGIC = b"KQRT\x01"
 RECORD = struct.Struct("!HQB")
+PROMPT_EMBEDDINGS = {'prompt.cpu-float32.embedding', 'prompt.cuda0-bfloat16.embedding'}
 
 
 def exact(source, size):
@@ -52,8 +53,8 @@ def unpack(descriptor, max_bytes=MAX_BYTES, max_files=MAX_FILES):
             name = exact(source, name_size).decode("utf-8")
             relative = Path(name)
             if (relative.is_absolute() or str(relative) != name or ".." in relative.parts
-                    or "\0" in name or relative.parts[0] not in {"python", "runtime", "provider", "prompt.pcm", "prompt.embedding"}
-                    or relative.parts[0] == "prompt.embedding" and (name != "prompt.embedding" or size != 4104 or executable)):
+                    or "\0" in name or relative.parts[0] not in {"python", "runtime", "provider", "prompt.pcm", *PROMPT_EMBEDDINGS}
+                    or relative.parts[0] in PROMPT_EMBEDDINGS and (name not in PROMPT_EMBEDDINGS or size != 4104 or executable)):
                 raise ValueError("unsafe runtime bundle path")
             count += 1
             total += size

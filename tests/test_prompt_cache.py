@@ -49,25 +49,26 @@ class CacheTests(unittest.TestCase):
         try:
             args = runtime.arguments()
             scope = (123, os.geteuid(), os.getegid(), '987654')
-            key = prompt_key(scope, runtime.manifest, args)
+            key = prompt_key(scope, runtime.manifest, args, 'cpu-float32')
             for changed_scope in ((124, scope[1], scope[2], scope[3]), (*scope[:3], '987655')):
-                self.assertNotEqual(prompt_key(changed_scope, runtime.manifest, args), key)
+                self.assertNotEqual(prompt_key(changed_scope, runtime.manifest, args, 'cpu-float32'), key)
             for group, field in (('model', 'revision'), ('files', 'model/data'), ('environment', 'site_packages_sha256')):
                 changed = copy.deepcopy(runtime.manifest)
                 changed[group][field] += '-changed'
-                self.assertNotEqual(prompt_key(scope, changed, args), key)
+                self.assertNotEqual(prompt_key(scope, changed, args, 'cpu-float32'), key)
             for field, value in (('sha256', 'f'*64), ('sample_rate_hz', 48000), ('sample_format', 'f32le')):
                 changed = copy.deepcopy(args)
                 changed['prompt_audio'][field] = value
-                self.assertNotEqual(prompt_key(scope, runtime.manifest, changed), key)
+                self.assertNotEqual(prompt_key(scope, runtime.manifest, changed, 'cpu-float32'), key)
             changed = copy.deepcopy(args)
             changed['consent'].update(allowed_use='named-purpose', purpose='different project')
-            self.assertNotEqual(prompt_key(scope, runtime.manifest, changed), key)
+            self.assertNotEqual(prompt_key(scope, runtime.manifest, changed, 'cpu-float32'), key)
             changed = copy.deepcopy(args)
             changed['consent']['recorded_at'] = '2026-09-08T00:00:00Z'
             changed.update(text='new text', seed=8)
-            self.assertEqual(prompt_key(scope, runtime.manifest, changed), key)
-            self.assertIsNone(prompt_key(None, runtime.manifest, args))
+            self.assertEqual(prompt_key(scope, runtime.manifest, changed, 'cpu-float32'), key)
+            self.assertIsNone(prompt_key(None, runtime.manifest, args, 'cpu-float32'))
+            self.assertNotEqual(prompt_key(scope, runtime.manifest, args, 'cuda0-bfloat16'), key)
         finally:
             runtime.doCleanups()
 
@@ -111,9 +112,12 @@ CACHE_TAIL = '''
 if request.get('prompt_cache'):
     import struct
     embedding=b'KQPE\\x01\\x00\\x00\\x00'+struct.pack('<1024f',*([.125]*1024))
-    if request.get('prompt_cache_input'):
-        assert pathlib.Path('/opt/prompt.embedding').read_bytes()==embedding
-        try:pathlib.Path('/opt/prompt.embedding').write_bytes(b'wrong');raise AssertionError('cache is writable')
+    producer='cuda0-bfloat16' if used=='cuda' else 'cpu-float32'
+    result['prompt_producer']=producer
+    if producer in request.get('prompt_cache_inputs',[]):
+        cached=pathlib.Path('/opt/prompt.'+producer+'.embedding')
+        assert cached.read_bytes()==embedding
+        try:cached.write_bytes(b'wrong');raise AssertionError('cache is writable')
         except OSError as error:assert error.errno==30
     if args['text']=='malformed-embedding':embedding=b'bad'
     os.umask(0o077)

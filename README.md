@@ -165,10 +165,13 @@ read-only, and likewise for the optional PTX JIT compiler library. A `cpu` runti
 
 Inside the job the worker uses CUDA only when torch can initialise it, in
 bfloat16 (emulated, and slower, before Ampere); float16 overflows in this
-engine and is never used. If CUDA is not
-offered or not usable, or a CUDA memory/runtime error occurs before any PCM was
-delivered, the same job runs on the CPU in float32 from the same seed, which is
-the computation a CPU runtime performs. The worker reports the device it used;
+engine and is never used. If CUDA is not offered or not usable, the job starts
+on the CPU in float32. A typed allocator OOM or a recognized CUDA, cuDNN,
+cuBLAS or NVML backend diagnostic permits one CPU retry before any PCM was
+emitted. Each attempt starts from the job seed. Unrelated runtime errors,
+invalid parameters, licence failures and admission/cancellation refusals do
+not trigger that retry. This is a recovery policy, not a claim of numerical
+audio equivalence or guaranteed recovery. The worker reports the device it used;
 the host refuses a GPU claim for a job that was not offered the GPU, keeps the
 device out of the client result and records it on the runtime as
 `last_device`. `models` reports each runtime's configured `device`.
@@ -361,7 +364,8 @@ service checks expiration while idle. `unload` and service shutdown discard
 all entries. There is no persistent cache, model retention, raw recording cache
 or unsafe tensor deserialization. This option defaults off.
 
-Each entry is scoped to the connected peer's kernel PID/UID/GID and process
+Each entry is scoped to the actual embedding producer's execution, device and
+compute dtype, the connected peer's kernel PID/UID/GID and process
 start identity, the complete selected runtime/model revision and byte digests,
 actual prompt PCM metadata/digest, and its permitted-use scope. A missing or
 exited peer identity bypasses caching. Different client processes cannot reuse
@@ -370,6 +374,15 @@ actual prompt descriptor, and every job repeats installed-asset authority and
 runtime byte checks. A new consent timestamp does not change the numerical
 embedding or permitted-use scope; that request's fresh consent digest remains
 bound to its own result. Text and seeds are not embedding inputs.
+
+The worker checks the loaded model's actual device and dtype before choosing
+an input, on every attempt. CUDA device 0/bfloat16 and CPU/float32 producers
+have separate entries, even under the same CUDA runtime manifest. A CPU
+fallback therefore uses a matching CPU entry or constructs a new prompt; it
+cannot reuse an embedding produced on CUDA. Both candidates can travel in the
+sealed bundle, within the same eight-entry cache bound. The float32 CPU storage
+format does not imply numerical equivalence between producers. Actual-model
+audio and performance effects require separate measurement.
 
 Only a validated final result with proved owned cleanup and a successfully
 sent terminal packet can populate the cache. An unload or shutdown also
