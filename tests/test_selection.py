@@ -69,6 +69,11 @@ class SelectionTests(unittest.TestCase):
             self.assertTrue(audio.startswith(b"RIFF"))
             self.assertEqual("conditioning" in result, model.mode == "prompt_clone")
 
+    def test_status_reports_a_device_for_every_bound_model(self):
+        self.start()
+        status = client_request(self.fixture.ipc, request_value("status"))
+        self.assertEqual(sorted(status["devices"]), sorted(model.model_id for model in self.models))
+
     def test_explicit_mismatch_and_unsupported_instruction_do_not_fallback(self):
         self.start()
         for mode, changes in (

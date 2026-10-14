@@ -7,7 +7,28 @@ otherwise runs the same job on the CPU. No wire request selects a device.
 """
 from __future__ import annotations
 
+import re
+
 DEVICES = ("cpu", "cuda")
+
+# Pinned torch 2.6: ATen/cuda/Exceptions.h (cuDNN / BLAS) and
+# c10/cuda/{CUDAException,CUDACachingAllocator}.cpp (runtime / NVML).
+# Status names for bad parameters, invalid values and licence failures are
+# deliberately absent: those are not recoverable backend execution failures.
+_BACKEND_STATUSES = r'(?:ALLOC_FAILED|NOT_INITIALIZED|ARCH_MISMATCH|MAPPING_ERROR|EXECUTION_FAILED|INTERNAL_ERROR|NOT_SUPPORTED)'
+_BACKEND_FAILURE = re.compile(
+    r'^(?:'
+    r'CUDA error: (?:out of memory|no kernel image(?: is available for execution on the device)?'
+    r'|initialization error|driver shutting down|unspecified launch failure'
+    r'|the launch timed out and was terminated|all CUDA-capable devices are busy or unavailable'
+    r'|CUDA-capable device\(s\) is/are busy or unavailable'
+    r'|CUDA driver version is insufficient for CUDA runtime version|unknown error)(?=[.\n]|$)'
+    r'|cuDNN error:\s*CUDNN_STATUS_' + _BACKEND_STATUSES + r'\b'
+    r'|(?:CUDA error:\s*)?CUBLAS_STATUS_' + _BACKEND_STATUSES + r'\b'
+    r'|NVML_SUCCESS == (?:r|DriverAPI::get\(\)->nvmlInit_v2_\(\)'
+    r'|DriverAPI::get\(\)->nvmlDeviceGetHandleByPciBusId_v2_\(\s*pci_id,\s*&nvml_device\)) INTERNAL ASSERT FAILED\b'
+    r'|CUDA driver initialization failed\b'
+    r')', re.IGNORECASE)
 
 
 def offer(profile: str, offered: str) -> tuple[str, str]:
@@ -42,11 +63,15 @@ def dtype(device: str, torch):
 
 
 def cuda_failure(error: BaseException, torch) -> bool:
-    """A failure that the CPU can recover: CUDA memory or runtime errors."""
+    """Recognize supported backend diagnostics, never an arbitrary RuntimeError.
+
+    A matching failure permits one CPU attempt; it does not promise recovery.
+    run() also requires that no PCM has been emitted by the CUDA attempt.
+    """
     out_of_memory = getattr(torch.cuda, "OutOfMemoryError", None)
     if out_of_memory is not None and isinstance(error, out_of_memory):
         return True
-    return isinstance(error, RuntimeError) and "CUDA" in str(error)
+    return isinstance(error, RuntimeError) and _BACKEND_FAILURE.match(str(error)) is not None
 
 
 def release(torch) -> None:
@@ -62,8 +87,8 @@ def run(offered: str, torch, load, generate, *, retry_allowed=lambda: True):
     """Return (device, result), retrying once on the CPU after a CUDA failure.
 
     ``load(device, dtype)`` returns a model and ``generate(model, device)``
-    returns the result; ``generate`` must reseed so that a CPU retry is the
-    same computation as a CPU-only job. A retry happens only while
+    returns the result; ``generate`` must reseed for each attempt. A retry
+    happens only while
     ``retry_allowed()`` is true, i.e. before any output was delivered.
     """
     device = select(offered, torch)

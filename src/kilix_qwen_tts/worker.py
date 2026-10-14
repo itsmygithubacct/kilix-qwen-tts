@@ -23,14 +23,20 @@ def _offline(event: str, _arguments: tuple) -> None:
         raise PermissionError("network access is disabled in the speech worker")
 
 
-def _generate_cached_clone(model, options, audio, cached, workspace, torch):
-    """x-vector prompt cache; the stored embedding is float32 on every device."""
+def _generate_cached_clone(model, options, audio, cached, workspace, torch, device):
+    """Choose a cache input by actual producer, again on every retry attempt."""
     from qwen_tts import VoiceClonePromptItem
-    from kilix_qwen_tts.prompt_cache import DIMENSIONS, ENCODING, MAGIC, read_embedding, validate_embedding
+    from kilix_qwen_tts.prompt_cache import (DIMENSIONS, ENCODING, MAGIC, PRODUCERS,
+                                           producer_for_device, read_embedding, validate_embedding)
+    producer = producer_for_device(device)
+    expected_device, expected_dtype = PRODUCERS[producer]
+    if (str(model.model.device) != expected_device
+            or model.model.dtype != getattr(torch, expected_dtype)):
+        raise ValueError("unsupported embedding producer")
     if model.model.config.speaker_encoder_config.enc_dim != DIMENSIONS:
         raise ValueError("unsupported speaker embedding shape")
-    if cached:
-        saved = read_embedding("/opt/prompt.embedding", readonly_mount=True)
+    if producer in cached:
+        saved = read_embedding(f"/opt/prompt.{producer}.embedding", readonly_mount=True)
         embedding = torch.tensor(ENCODING.unpack(saved[len(MAGIC):]), dtype=torch.float32, device="cpu")
     else:
         with torch.random.fork_rng(devices=[]):
@@ -47,7 +53,8 @@ def _generate_cached_clone(model, options, audio, cached, workspace, torch):
     items = [VoiceClonePromptItem(None, embedding, True, False, None)]
     saved = validate_embedding(MAGIC + ENCODING.pack(*embedding.tolist()))
     (workspace / "prompt.embedding").write_bytes(saved)
-    return model.generate_voice_clone(**options, voice_clone_prompt=items)
+    waves, rate = model.generate_voice_clone(**options, voice_clone_prompt=items)
+    return waves, rate, producer
 
 
 def main() -> None:
@@ -68,8 +75,12 @@ def main() -> None:
         stream = WorkerStream(sys.stdout.buffer)
     args = request["args"]
     cache = request.get("prompt_cache", False)
-    cached = request.get("prompt_cache_input", False)
-    if (type(cache) is not bool or type(cached) is not bool or cached and not cache
+    cached = request.get("prompt_cache_inputs", [])
+    from kilix_qwen_tts.prompt_cache import producers_for_profile
+    if (type(cache) is not bool or type(cached) is not list
+            or any(type(item) is not str or item not in producers_for_profile(profile) for item in cached)
+            or len(cached) > len(producers_for_profile(profile)) or len(set(cached)) != len(cached)
+            or cached and not cache
             or cache and args["mode"] != "prompt_clone"):
         raise ValueError("invalid prompt cache selection")
     root = Path(request["runtime"])
@@ -125,9 +136,10 @@ def main() -> None:
             )
 
         def generate(model, device):
-            # Every attempt starts from the job seed, so a CPU retry is the
-            # same computation as a CPU-only job.
+            # A CPU retry must not inherit an advanced RNG from the CUDA
+            # attempt. This does not assert numerical equivalence of devices.
             torch.manual_seed(args["seed"])
+            producer = None
             incremental = None
             if stream is not None:
                 from kilix_qwen_tts.codec_stream import IncrementalCodes
@@ -139,7 +151,7 @@ def main() -> None:
                 if args["mode"] == "prompt_clone":
                     audio = (prompt_audio, args["prompt_audio"]["sample_rate_hz"])
                     if cache:
-                        waves, rate = _generate_cached_clone(model, options, audio, cached, workspace, torch)
+                        waves, rate, producer = _generate_cached_clone(model, options, audio, cached, workspace, torch, device)
                     else:
                         waves, rate = model.generate_voice_clone(
                             **options, ref_audio=audio, x_vector_only_mode=True,
@@ -155,9 +167,9 @@ def main() -> None:
                     waves, rate = model.generate_voice_design(**options, instruct=instruction)
                 else:
                     raise ValueError("unsupported synthesis mode")
-            return waves, rate, incremental
+            return waves, rate, incremental, producer
 
-        used, (waves, sample_rate, incremental) = devices.run(
+        used, (waves, sample_rate, incremental, producer) = devices.run(
             offered, torch, load, generate, retry_allowed=lambda: not emitted)
     if len(waves) != 1 or sample_rate != 24000:
         raise ValueError("unexpected engine audio format")
@@ -186,6 +198,8 @@ def main() -> None:
               "audio": {"sha256": hashlib.sha256(payload).hexdigest(), "byte_length": len(payload)}}
     if conditioning is not None:
         result["conditioning"] = conditioning
+    if cache:
+        result["prompt_producer"] = producer
     if stream is not None:
         stream.finish(result)
     else:

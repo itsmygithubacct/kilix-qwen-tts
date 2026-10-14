@@ -14,7 +14,7 @@ from kilix_qwen_tts.owned import ExecutionPolicy, OwnedExecution, from_options
 from kilix_qwen_tts.protocol import ProtocolError
 
 try:
-    from voicelib import device_leases
+    import kilix_device_lease as device_leases
 except ImportError:
     device_leases = None
 
@@ -83,10 +83,18 @@ class OwnedCleanupTests(unittest.TestCase):
         self.assertIsNone(from_options(SimpleNamespace()))
         with self.assertRaises(ProtocolError):
             from_options(SimpleNamespace(lease_namespace='/tmp/lease'))
-        with patch.dict(sys.modules, {'voicelib': None}):
+        with patch.dict(sys.modules, {'kilix_device_lease': None}):
             with self.assertRaises(ProtocolError) as caught:
                 ExecutionPolicy('cpu-development')
         self.assertEqual(caught.exception.code, 'PROVIDER_UNAVAILABLE')
+
+    def test_unsupported_canonical_api_never_falls_back(self):
+        for version in (None, 'kilix.device-lease/v2'):
+            with self.subTest(version=version), patch.dict(
+                    sys.modules, {'kilix_device_lease': SimpleNamespace(VERSION=version)}):
+                with self.assertRaises(ProtocolError) as caught:
+                    ExecutionPolicy('cpu-development')
+                self.assertEqual(caught.exception.code, 'PROVIDER_UNAVAILABLE')
 
     @unittest.skipIf(device_leases is None, 'optional shared lease implementation is absent')
     def test_proved_cleanup_and_failed_spawn_release_real_grants_without_fd_leaks(self):

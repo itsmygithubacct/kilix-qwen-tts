@@ -240,17 +240,17 @@ def run_job(runtime: InstalledRuntime, audio_fd: int | None, args: dict, *,
             deadline: float, cancel: threading.Event,
             disconnected: Callable[[], bool] = lambda: False,
             execution_policy=None, job_id=None, progress=None, on_chunk=None,
-            prompt_embedding=None, on_embedding=None) -> tuple[dict, bytes]:
+            prompt_embeddings=None, on_embedding=None) -> tuple[dict, bytes]:
     from .owned import OwnedExecution
     with OwnedExecution(execution_policy, job_id=job_id, workload="tts-utterance", deadline=deadline,
                         cancelled=cancel.is_set, disconnected=disconnected, progress=progress) as owner:
         return _run_owned_job(runtime, audio_fd, args, deadline=deadline, cancel=cancel,
                               disconnected=disconnected, owner=owner, on_chunk=on_chunk,
-                              prompt_embedding=prompt_embedding, on_embedding=on_embedding)
+                              prompt_embeddings=prompt_embeddings, on_embedding=on_embedding)
 
 
 def _run_owned_job(runtime, audio_fd, args, *, deadline, cancel, disconnected, owner, on_chunk=None,
-                   prompt_embedding=None, on_embedding=None):
+                   prompt_embeddings=None, on_embedding=None):
     if cancel.is_set() or disconnected():
         raise ProtocolError("CANCELED", "job canceled")
     if time.monotonic() >= deadline:
@@ -285,9 +285,12 @@ def _run_owned_job(runtime, audio_fd, args, *, deadline, cancel, disconnected, o
         environment.update(CUDA_VISIBLE_DEVICES="0", CUDA_CACHE_DISABLE="1",
                            CUDA_MODULE_LOADING="LAZY")
     if (on_embedding is not None and (not callable(on_embedding) or args["mode"] != "prompt_clone")
-            or prompt_embedding is not None and on_embedding is None):
+            or prompt_embeddings is not None and on_embedding is None):
         raise ProtocolError("INVALID_REQUEST", "invalid prompt cache selection")
-    cache_options = {"prompt_embedding": prompt_embedding} if prompt_embedding is not None else {}
+    from .prompt_cache import producer_for_device, validate_inputs
+    if prompt_embeddings is not None:
+        validate_inputs(prompt_embeddings, profile)
+    cache_options = {"prompt_embeddings": prompt_embeddings} if prompt_embeddings else {}
     if gpu_nodes:
         cache_options["gpu_nodes"] = gpu_nodes
     with tempfile.TemporaryDirectory(prefix="kilix-qwen-job-") as workspace, tempfile.TemporaryFile() as output, launch(runtime, workspace, audio_fd, check, **cache_options) as (command, descriptors):
@@ -295,7 +298,7 @@ def _run_owned_job(runtime, audio_fd, args, *, deadline, cancel, disconnected, o
                "audio_fd": None, "args": args, "workspace": "/job",
                "profile": profile, "device": offered}
         if on_embedding is not None:
-            job.update(prompt_cache=True, prompt_cache_input=prompt_embedding is not None)
+            job.update(prompt_cache=True, prompt_cache_inputs=sorted(prompt_embeddings or {}))
         stream = None
         if on_chunk is not None:
             from .streaming import WorkerStreamReader
@@ -341,6 +344,8 @@ def _run_owned_job(runtime, audio_fd, args, *, deadline, cancel, disconnected, o
                         "audio", "device"}
             if args["mode"] == "prompt_clone":
                 required.add("conditioning")
+            if on_embedding is not None:
+                required.add("prompt_producer")
             # The worker reports where it ran; it may fall back to the CPU but
             # can never claim a GPU that this job was not offered.
             if (type(result) is not dict or set(result) != required
@@ -358,6 +363,9 @@ def _run_owned_job(runtime, audio_fd, args, *, deadline, cancel, disconnected, o
                             "consent_sha256": hashlib.sha256(consent).hexdigest()}
                 if result["conditioning"] != expected:
                     raise ProtocolError("MALFORMED_WORKER_RESULT", "unbound conditioning result")
+            if on_embedding is not None:
+                if result["prompt_producer"] != producer_for_device(result["device"]):
+                    raise ProtocolError("MALFORMED_WORKER_RESULT", "unbound embedding producer")
             audio_path = Path(workspace) / "output.wav"
             descriptor = os.open(audio_path, os.O_RDONLY | os.O_NONBLOCK | os.O_NOFOLLOW | os.O_CLOEXEC)
             with os.fdopen(descriptor, "rb") as audio_file:
@@ -379,7 +387,7 @@ def _run_owned_job(runtime, audio_fd, args, *, deadline, cancel, disconnected, o
             if on_embedding is not None:
                 from .prompt_cache import read_embedding
                 check()
-                on_embedding(read_embedding(Path(workspace) / "prompt.embedding"))
+                on_embedding(result.pop("prompt_producer"), read_embedding(Path(workspace) / "prompt.embedding"))
             # The client result contract is unchanged; the device stays local.
             record_device(runtime, offered, result.pop("device"))
             return result, payload

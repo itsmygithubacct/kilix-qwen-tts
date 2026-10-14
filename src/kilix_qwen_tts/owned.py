@@ -17,9 +17,11 @@ class ExecutionPolicy:
     """Coordinate a selected device; this grants no hardware/profile admission."""
     def __init__(self, device: str, *, namespace: str | None = None):
         try:
-            from voicelib import device_leases
+            import kilix_device_lease as device_leases
         except ImportError as error:
             raise ProtocolError("PROVIDER_UNAVAILABLE", "shared execution lease API is unavailable") from error
+        if getattr(device_leases, "VERSION", None) != "kilix.device-lease/v1":
+            raise ProtocolError("PROVIDER_UNAVAILABLE", "shared execution lease API version is unsupported")
         self.module = device_leases
         self.device = device
         self.namespace = namespace

@@ -16,7 +16,7 @@ from kilix_qwen_tts.service import client_request, request_value
 import test_runtime as runtime_fixture
 
 try:
-    from voicelib import device_leases
+    import kilix_device_lease as device_leases
 except ImportError:
     device_leases = None
 

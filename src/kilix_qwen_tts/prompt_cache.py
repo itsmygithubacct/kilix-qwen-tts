@@ -21,6 +21,32 @@ ENCODING = struct.Struct('<1024f')
 PAYLOAD_BYTES = len(MAGIC) + ENCODING.size
 MAX_ENTRIES = 8
 IDLE_SECONDS = 300
+# These are execution identities, not the float32 CPU storage format. The
+# pinned engine extracts speaker embeddings on model.device / model.dtype.
+PRODUCERS = {'cpu-float32': ('cpu', 'float32'),
+             'cuda0-bfloat16': ('cuda:0', 'bfloat16')}
+PRODUCER_EXECUTION = 'qwen3-tts.create_voice_clone_prompt/x-vector-only/v1'
+
+
+def producer_for_device(device):
+    if type(device) is not str or device not in {'cpu', 'cuda'}:
+        raise ValueError('unsupported embedding device')
+    return 'cpu-float32' if device == 'cpu' else 'cuda0-bfloat16'
+
+
+def producers_for_profile(profile):
+    producer_for_device(profile)  # Refuse unknown profiles.
+    return ('cpu-float32',) if profile == 'cpu' else tuple(PRODUCERS)
+
+
+def validate_inputs(embeddings, profile):
+    allowed = producers_for_profile(profile)
+    if (type(embeddings) is not dict or len(embeddings) > len(allowed)
+            or any(type(key) is not str or key not in allowed for key in embeddings)):
+        raise ProtocolError('INVALID_REQUEST', 'invalid prompt cache inputs')
+    for payload in embeddings.values():
+        validate_embedding(payload)
+    return embeddings
 
 
 def validate_embedding(payload):
@@ -61,18 +87,22 @@ def peer_scope(channel):
         return None
 
 
-def prompt_key(scope, manifest, arguments):
+def prompt_key(scope, manifest, arguments, producer):
+    if type(producer) is not str or producer not in PRODUCERS:
+        raise ValueError('unsupported embedding producer')
     if scope is None or arguments['mode'] != 'prompt_clone':
         return None
     consent = arguments['consent']
     # Every request must already have freshly validated consent and actual PCM.
     # A changed attestation timestamp does not change its permitted use or the
     # numerical speaker embedding. It is still bound into that job's result.
-    identity = {'schema': 'kilix.qwen-tts.prompt-cache/v1', 'peer': scope,
+    device, compute_dtype = PRODUCERS[producer]
+    identity = {'schema': 'kilix.qwen-tts.prompt-cache/v2', 'peer': scope,
                 'runtime': manifest, 'audio': arguments['prompt_audio'],
+                'producer': {'execution': PRODUCER_EXECUTION, 'device': device, 'compute_dtype': compute_dtype},
                 'consent_scope': {k: consent[k] for k in ('schema', 'source_sha256', 'allowed_use', 'purpose')}}
     payload = json.dumps(identity, sort_keys=True, separators=(',', ':'), ensure_ascii=False, allow_nan=False).encode()
-    return hashlib.sha256(b'KILIX_QWEN_PROMPT_CACHE_V1\0' + payload).digest()
+    return hashlib.sha256(b'KILIX_QWEN_PROMPT_CACHE_V2\0' + payload).digest()
 
 
 class PromptCache:
