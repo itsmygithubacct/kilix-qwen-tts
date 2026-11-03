@@ -2,13 +2,16 @@
 from __future__ import annotations
 
 from contextlib import contextmanager
+import errno
 import json
+import os
 import subprocess
 import sys
 from pathlib import Path
 import socket
 import time
 import unittest
+from unittest.mock import patch
 
 from kilix_qwen_tts.owned import ExecutionPolicy
 from kilix_qwen_tts.protocol import ProtocolError, receive_packet, send_packet
@@ -80,6 +83,43 @@ def assert_reusable(fixture):
 
 @unittest.skipIf(device_leases is None, 'optional shared lease implementation is absent')
 class LeasedRuntimeTests(unittest.TestCase):
+    def test_queued_disconnect_preserves_other_owner_and_releases_admission(self):
+        with prepared() as fixture:
+            policy = fixture.service.execution_policy
+            holder = device_leases.acquire(job_id='external-holder', workload='llm-turn',
+                device='another-device', deadline=time.monotonic()+5, namespace=policy.namespace)
+            try:
+                with raw(fixture) as channel:
+                    event, descriptors = receive_packet(channel)
+                    self.assertEqual(event['type'], 'queued')
+                    self.assertFalse(descriptors)
+                    self.assertFalse(list(fixture.jobs.iterdir()))
+                until(lambda: client_request(fixture.ipc, request_value('status'))['provider_state'] == 'ready')
+                holder.check()
+                self.assertFalse(list(fixture.jobs.iterdir()))
+            finally:
+                holder.release(cleanup_complete=True)
+            assert_reusable(fixture)
+            invoke(fixture)
+
+    def test_scratch_disk_faults_release_grant_and_allow_successor_job(self):
+        before = len(os.listdir('/proc/self/fd'))
+        for fault in (errno.ENOSPC, errno.EDQUOT, errno.EIO):
+            with self.subTest(fault=fault), prepared() as fixture:
+                # Patch only the runtime's module binding. Changing the shared
+                # tempfile module would fail prompt verification before the
+                # lease is acquired and would not exercise grant teardown.
+                with patch('kilix_qwen_tts.runtime.tempfile', wraps=runtime_fixture.tempfile) as scratch:
+                    scratch.TemporaryFile.side_effect = OSError(fault, 'synthetic scratch failure')
+                    with self.assertRaises(ProtocolError) as caught:
+                        invoke(fixture)
+                    scratch.TemporaryFile.assert_called_once()
+                self.assertEqual(caught.exception.code, 'PROVIDER_ERROR')
+                self.assertFalse(list(fixture.jobs.iterdir()))
+                assert_reusable(fixture)
+                invoke(fixture)
+        self.assertEqual(len(os.listdir('/proc/self/fd')), before)
+
     def test_actual_success_and_engine_failure_release_only_after_cleanup(self):
         for mode in ('success', 'fail'):
             with self.subTest(mode=mode), prepared(mode) as fixture:
