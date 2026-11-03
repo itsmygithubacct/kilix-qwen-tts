@@ -5,6 +5,7 @@ import os
 import threading
 import time
 import unittest
+from provider_clock import provider_clock
 from unittest.mock import patch
 
 from kilix_qwen_tts import service as module
@@ -41,7 +42,7 @@ def handlers_done(fixture):
 class CacheCommitTests(unittest.TestCase):
     def test_late_cancel_and_deadline_never_populate_or_supply_next_job(self):
         for mode in ('cancel', 'deadline'):
-            with self.subTest(mode=mode), prepared() as fixture, ThreadPoolExecutor(max_workers=1) as pool:
+            with self.subTest(mode=mode), provider_clock() as advance, prepared() as fixture, ThreadPoolExecutor(max_workers=1) as pool:
                 returned = threading.Event()
                 release = threading.Event()
                 original = module.run_job
@@ -50,9 +51,8 @@ class CacheCommitTests(unittest.TestCase):
                     returned.set()
                     assert release.wait(3)
                     return result
-                started = time.monotonic()
                 with patch.object(module, 'run_job', side_effect=pause):
-                    future = pool.submit(submit, fixture, timeout=1 if mode == 'deadline' else 5)
+                    future = pool.submit(submit, fixture, timeout=5)
                     try:
                         self.assertTrue(returned.wait(2))
                         self.assertFalse(descendants(os.getpid()))
@@ -63,7 +63,7 @@ class CacheCommitTests(unittest.TestCase):
                             ack = client_request(fixture.ipc, request_value('cancel', job_id='cache-policy'))
                             self.assertTrue(ack['cancel_requested'])
                         else:
-                            time.sleep(max(0, started + 1.05 - time.monotonic()))
+                            advance(5)
                     finally:
                         release.set()
                     with self.assertRaises(ProtocolError) as error:

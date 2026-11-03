@@ -11,6 +11,7 @@ from pathlib import Path
 import socket
 import time
 import unittest
+from provider_clock import provider_clock
 from unittest.mock import patch
 
 from kilix_qwen_tts.owned import ExecutionPolicy
@@ -132,11 +133,13 @@ class LeasedRuntimeTests(unittest.TestCase):
 
     def test_actual_cancel_deadline_and_disconnect_allow_safe_handoff(self):
         for ending in ('cancel', 'deadline', 'disconnect'):
-            with self.subTest(ending=ending), prepared('escape') as fixture:
-                with raw(fixture, 'escape', .6 if ending == 'deadline' else 5) as channel:
+            with self.subTest(ending=ending), provider_clock() as advance, prepared('escape') as fixture:
+                with raw(fixture, 'escape', 5) as channel:
                     until(lambda: waiting(fixture))
                     if ending == 'cancel':
                         client_request(fixture.ipc, request_value('cancel', job_id='leased-job'))
+                    if ending == 'deadline':
+                        advance(5)
                     if ending == 'disconnect':
                         channel.close()
                     else:

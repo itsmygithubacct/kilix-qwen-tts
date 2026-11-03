@@ -8,6 +8,7 @@ import socket
 import subprocess
 import time
 import unittest
+from provider_clock import provider_clock
 from unittest.mock import patch
 
 import kilix_qwen_tts.service as service_module
@@ -134,9 +135,12 @@ class BackpressureTests(unittest.TestCase):
 
     def test_disconnect_and_absolute_deadline_reap_saturated_tree(self):
         for mode in ('disconnect', 'deadline'):
-            with self.subTest(mode=mode), saturated(timeout=1 if mode == 'deadline' else 10) as (fixture, peer, owned, started):
+            with self.subTest(mode=mode), provider_clock() as advance, saturated(timeout=10) as (fixture, peer, owned, _started):
+                started = time.monotonic()
                 if mode == 'disconnect':
                     peer.close()
+                else:
+                    advance(10)
                 self.assert_reaped(fixture, owned)
                 self.assertLess(time.monotonic() - started, 2)
 

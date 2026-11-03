@@ -7,6 +7,7 @@ import os
 import tempfile
 import time
 import unittest
+from provider_clock import provider_clock
 
 from kilix_qwen_tts.protocol import ProtocolError
 from kilix_qwen_tts.runtime import tree_digest
@@ -186,14 +187,16 @@ class ProcessStreamTests(unittest.TestCase):
 
     def test_partial_stream_cancel_and_deadline_release_the_owned_job(self):
         for ending in ("cancel", "deadline"):
-            with self.subTest(ending=ending), prepared() as fixture, fixture.audio.open("rb") as audio:
+            with self.subTest(ending=ending), provider_clock() as advance, prepared() as fixture, fixture.audio.open("rb") as audio:
                 seen = []
                 def consume(*row):
                     seen.append(row)
                     if ending == "cancel":
                         client_request(fixture.ipc, request_value("cancel", job_id="stream"))
+                    elif len(seen) == 1:
+                        advance(5)
                 value = request_value("submit", job_id="stream", args=fixture.arguments("stream-hold"),
-                                      timeout=1 if ending == "deadline" else 5, stream=True)
+                                      timeout=5, stream=True)
                 with self.assertRaises(ProtocolError) as error:
                     client_request(fixture.ipc, value, audio.fileno(), on_chunk=consume)
                 self.assertEqual(error.exception.code, "CANCELED" if ending == "cancel" else "DEADLINE_EXCEEDED")
