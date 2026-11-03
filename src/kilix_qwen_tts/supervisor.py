@@ -6,6 +6,7 @@ import fcntl
 import json
 import os
 from pathlib import Path
+import select
 import signal
 import socket
 import subprocess
@@ -111,8 +112,23 @@ def main():
             if descriptor != guard_fd:
                 os.close(descriptor)
         assert worker.stdin is not None
-        worker.stdin.write(payload)
-        worker.stdin.close()
+        # A worker may stall before reading its request. A blocking buffered
+        # write would prevent SIGTERM from reaching the teardown below: the
+        # signal handler only sets stopping, and Python retries the write.
+        # Keep the dedicated descendant owner responsive until EOF is sent.
+        descriptor = worker.stdin.fileno()
+        os.set_blocking(descriptor, False)
+        pending = memoryview(payload)
+        try:
+            while pending and not stopping and worker.poll() is None:
+                try:
+                    written = os.write(descriptor, pending)
+                except BlockingIOError:
+                    select.select([], [descriptor], [], 0.025)
+                    continue
+                pending = pending[written:]
+        finally:
+            worker.stdin.close()
         while worker.poll() is None and not stopping:
             time.sleep(0.01)
         return 130 if stopping else worker.returncode
