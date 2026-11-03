@@ -43,6 +43,27 @@ phase('first' if '--only-group' in sys.argv else 'second')
 '''
 
 
+DEADLINE_BOOTSTRAP = """import importlib.util,os,pathlib,subprocess,sys,time,types
+source=pathlib.Path(SOURCE)
+spec=importlib.util.spec_from_file_location('owned_build_under_test',source)
+module=importlib.util.module_from_spec(spec);spec.loader.exec_module(module)
+real_popen=subprocess.Popen
+bootstrap=str(pathlib.Path(__file__).absolute())
+def spawn(argv,**kwargs):
+ # Keep the real controller and dedicated subreaper. Interpose only its clock.
+ if len(argv)>4 and argv[3]==str(source) and argv[4]=='--owned-build':
+  argv=[*argv[:3],bootstrap,*argv[4:]]
+ return real_popen(argv,**kwargs)
+module.subprocess=types.SimpleNamespace(Popen=spawn,CalledProcessError=subprocess.CalledProcessError,DEVNULL=subprocess.DEVNULL)
+root=pathlib.Path(os.environ['BUILD_TEST_ROOT'])
+def monotonic():
+ expired=os.environ['BUILD_TEST_ACTION']=='timeout' and (root/'pids.json').exists()
+ return time.monotonic()+(10 if expired else 0)
+module.time=types.SimpleNamespace(monotonic=monotonic,sleep=time.sleep)
+raise SystemExit(module.main())
+"""
+
+
 def live(pid):
     try:
         raw = Path(f'/proc/{pid}/stat').read_text()
@@ -60,13 +81,15 @@ class BuildTests(unittest.TestCase):
         self.installer = self.root / 'fake-uv'
         self.installer.write_text(INSTALLER.replace('PYTHON_SOURCE', repr(PYTHON)))
         self.installer.chmod(0o700)
+        self.deadline_bootstrap = self.root / 'deadline-bootstrap.py'
+        self.deadline_bootstrap.write_text(DEADLINE_BOOTSTRAP.replace('SOURCE', repr(str(self.tool))))
 
     def start(self, path, *, phase='first', action='success', timeout=5):
         environment = dict(os.environ, BUILD_TEST_ROOT=str(self.root),
                            BUILD_TEST_PHASE=phase, BUILD_TEST_ACTION=action)
         log = (self.root / 'builder.log').open('ab')
         self.addCleanup(log.close)
-        process = subprocess.Popen([sys.executable, str(self.tool), '--uv', str(self.installer),
+        process = subprocess.Popen([sys.executable, str(self.deadline_bootstrap if action == 'timeout' else self.tool), '--uv', str(self.installer),
                                     '--destination', str(path), '--offline', '--timeout', str(timeout)],
                                    env=environment, stdout=log, stderr=subprocess.STDOUT)
         def cleanup():
@@ -93,7 +116,7 @@ class BuildTests(unittest.TestCase):
                     (self.root / 'pids.json').unlink(missing_ok=True)
                     destination = self.root / (phase + '-' + action)
                     process = self.start(destination, phase=phase, action=action,
-                                         timeout=.5 if action == 'timeout' else 5)
+                                         timeout=5)
                     pids = self.pids(process)
                     if action == 'interrupt':
                         process.send_signal(signal.SIGINT)
