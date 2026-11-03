@@ -5,8 +5,10 @@ installed broker or optional kilix_device_lease adapter was exercised.
 """
 from concurrent.futures import ThreadPoolExecutor
 import os
+import time
 from types import SimpleNamespace
 import unittest
+from unittest.mock import patch
 
 from kilix_qwen_tts.protocol import ProtocolError
 from kilix_qwen_tts.service import client_request, request_value
@@ -87,16 +89,26 @@ class PromptGrantTests(unittest.TestCase):
 
     def test_cancel_and_deadline_reap_worker_before_release_and_never_commit(self):
         for ending in ('cancel', 'deadline'):
-            with self.subTest(ending=ending), fixtures.prepared() as fixture, ThreadPoolExecutor(max_workers=1) as pool:
+            # Advance only the provider's clocks after the real worker is ready.
+            # A short wall-clock deadline can expire during interpreter startup,
+            # before the marker this test needs ever exists.
+            offset = [0.0]
+            clock = SimpleNamespace(monotonic=lambda: time.monotonic() + offset[0], sleep=time.sleep)
+            with (self.subTest(ending=ending), fixtures.prepared() as fixture,
+                  patch('kilix_qwen_tts.service.time', clock),
+                  patch('kilix_qwen_tts.runtime.time', clock),
+                  ThreadPoolExecutor(max_workers=1) as pool):
                 policy = PrivatePolicy(fixture)
                 fixture.service.execution_policy = policy
                 future = pool.submit(fixtures.submit, fixture, 'wait-generate',
-                                     timeout=1 if ending == 'deadline' else 8)
+                                     timeout=8)
                 wait_until(lambda: bool(list(fixture.jobs.glob('*/ready'))), 3)
                 self.assertFalse(policy.grants[0].released)
                 if ending == 'cancel':
                     result = client_request(fixture.ipc, request_value('cancel', job_id='producer-job'))
                     self.assertTrue(result['cancel_requested'])
+                else:
+                    offset[0] = 8.0
                 with self.assertRaises(ProtocolError) as error:
                     future.result(timeout=5)
                 self.assertEqual(error.exception.code, 'CANCELED' if ending == 'cancel' else 'DEADLINE_EXCEEDED')
