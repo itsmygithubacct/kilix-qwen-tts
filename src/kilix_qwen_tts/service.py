@@ -151,9 +151,21 @@ class Service:
                     channel.close()
                     continue
                 self._threads = [thread for thread in self._threads if thread.is_alive()]
-                thread = threading.Thread(target=self._handle, args=(channel,), daemon=True)
+                try:
+                    thread = threading.Thread(target=self._handle, args=(channel,), daemon=True)
+                    thread.start()
+                except (RuntimeError, OSError):
+                    # No handler owns this connection if allocation/start
+                    # fails. Return its permit and leave the endpoint usable.
+                    channel.close()
+                    self._slots.release()
+                    continue
+                except BaseException:
+                    channel.close()
+                    self._slots.release()
+                    raise
+                # Shutdown must never attempt to join an unstarted thread.
                 self._threads.append(thread)
-                thread.start()
         finally:
             self.stop()
             listener.close()
