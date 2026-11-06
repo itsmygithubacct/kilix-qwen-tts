@@ -59,8 +59,15 @@ def _generate_cached_clone(model, options, audio, cached, workspace, torch, devi
 
 def main() -> None:
     request = json.loads(sys.stdin.buffer.read(65_537))
+    from kilix_qwen_tts.device import failure_kind
+    from kilix_qwen_tts.failure import guard
+    guard(request.get("workspace"), lambda: _execute(request), classify=failure_kind)
+
+
+def _execute(request) -> None:
     from kilix_qwen_tts.bootstrap import limits
     from kilix_qwen_tts.device import offer
+    from kilix_qwen_tts.failure import CorruptInput
     profile, offered = offer(request.get("profile", "cpu"), request.get("device", "cpu"))
     # The same ceilings the trusted bootstrap applied for this profile.
     for kind, value in limits(profile).items():
@@ -112,13 +119,13 @@ def main() -> None:
             os.close(descriptor)
             if (len(payload) != prompt["byte_length"]
                     or hashlib.sha256(payload).hexdigest() != prompt["sha256"]):
-                raise ValueError("prompt digest mismatch")
+                raise CorruptInput("prompt digest mismatch")
             dtype = "<i2" if prompt["sample_format"] == "s16le" else "<f4"
             prompt_audio = np.frombuffer(payload, dtype=dtype).astype(np.float32)
             if dtype == "<i2":
                 prompt_audio /= 32768.0
             if not np.isfinite(prompt_audio).all():
-                raise ValueError("non-finite prompt samples")
+                raise CorruptInput("non-finite prompt samples")
             consent = json.dumps(args["consent"], separators=(",", ":"), sort_keys=True).encode()
             conditioning = {"prompt_sha256": prompt["sha256"],
                             "consent_sha256": hashlib.sha256(consent).hexdigest()}

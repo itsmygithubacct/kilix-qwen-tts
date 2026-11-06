@@ -20,6 +20,7 @@ import threading
 import time
 from typing import Callable
 
+from .failure import classify
 from .protocol import ProtocolError, decode_payload
 
 RUNTIME_SCHEMA = "kilix.qwen-tts.runtime/v1"
@@ -320,12 +321,22 @@ def _run_owned_job(runtime, audio_fd, args, *, deadline, cancel, disconnected, o
             while process.poll() is None:
                 check()
                 if stream is not None:
-                    stream.drain()
+                    try:
+                        stream.drain()
+                    except ProtocolError as error:
+                        # A worker that already exited may have left a partial
+                        # frame. Classify that exit instead of hiding it.
+                        if error.code != "MALFORMED_WORKER_RESULT" or process.poll() is None:
+                            raise
+                        break
                 cancel.wait(0.025)
             if cancel.is_set() or disconnected():
                 raise ProtocolError("CANCELED", "job canceled")
             if time.monotonic() >= deadline:
                 raise ProtocolError("DEADLINE_EXCEEDED", "job deadline exceeded")
+            found = classify(process.returncode, workspace)
+            if found is not None:
+                raise ProtocolError(*found)
             if process.returncode != 0:
                 raise ProtocolError("ENGINE_FAILED", "speech worker failed")
             if stream is not None:

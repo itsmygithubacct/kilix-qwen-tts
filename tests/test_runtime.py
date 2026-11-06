@@ -56,6 +56,23 @@ if args['text']=='escape':
     subprocess.Popen(['/usr/bin/python3','-c','import time;time.sleep(60)'],start_new_session=True)
     pathlib.Path('/job/ready').write_text('ready')
     time.sleep(60)
+if args['text'] in ('oom','device','corrupt'):
+    kind={'oom':'oom','device':'device_loss','corrupt':'corrupt'}[args['text']]
+    pathlib.Path('/job/failure.json').write_text('{"kind":"'+kind+'"}')
+    raise SystemExit(3)
+if args['text']=='disk':
+    raise SystemExit(4)
+if args['text']=='crash':
+    raise SystemExit(137)
+if args['text']=='bad-record':
+    pathlib.Path('/job/failure.json').write_text('not-json')
+    raise SystemExit(3)
+if args['text']=='fail':
+    raise SystemExit(1)
+if args['text']=='hold':
+    pathlib.Path('/job/holding').write_text('1')
+    while not pathlib.Path('/job/release').exists():
+        time.sleep(0.05)
 if args['text']=='bad':
     print('{"result":NaN}');raise SystemExit(0)
 destination=pathlib.Path('/job/output.wav')
@@ -467,3 +484,116 @@ class RuntimeTests(unittest.TestCase):
                 os.write(fd, b'mutate')
         finally:
             os.close(fd)
+
+    def test_classified_worker_stops_keep_their_codes(self):
+        expected = {
+            'oom': ('DEVICE_UNAVAILABLE', 'speech worker ran out of memory'),
+            'device': ('DEVICE_UNAVAILABLE', 'speech device is unavailable'),
+            'corrupt': ('INVALID_REQUEST', 'speech worker refused corrupt input'),
+            'disk': ('INSUFFICIENT_DISK', 'speech worker ran out of disk'),
+            'crash': ('WORKER_CRASH', 'speech worker crashed'),
+        }
+        for text, (code, message) in expected.items():
+            with self.subTest(text=text), self.audio.open('rb') as source:
+                with self.assertRaises(ProtocolError) as caught:
+                    run_job(self.runtime, source.fileno(), self.arguments(text),
+                            deadline=time.monotonic() + 5, cancel=threading.Event())
+                self.assertEqual((caught.exception.code, str(caught.exception)), (code, message))
+            self.assertEqual(list(self.jobs.iterdir()), [])
+        for text in ('bad-record', 'fail'):
+            with self.subTest(text=text), self.audio.open('rb') as source:
+                with self.assertRaises(ProtocolError) as caught:
+                    run_job(self.runtime, source.fileno(), self.arguments(text),
+                            deadline=time.monotonic() + 5, cancel=threading.Event())
+                self.assertEqual(caught.exception.code, 'ENGINE_FAILED')
+                self.assertEqual(str(caught.exception), 'speech worker failed')
+            self.assertEqual(list(self.jobs.iterdir()), [])
+
+    def test_crashed_worker_releases_the_service_for_the_next_job(self):
+        self.start()
+        outcome = {}
+
+        def running():
+            try:
+                with self.audio.open('rb') as source:
+                    client_request(self.ipc, request_value('submit', job_id='crash-job',
+                        args=self.arguments('escape'), timeout=8), source.fileno())
+            except Exception as error:
+                outcome['error'] = error
+
+        thread = threading.Thread(target=running)
+        thread.start()
+        deadline = time.monotonic() + 3
+        while not list(self.jobs.glob('*/ready')) and time.monotonic() < deadline:
+            time.sleep(0.01)
+        self.assertTrue(list(self.jobs.glob('*/ready')))
+        owned = []
+        pending = [os.getpid()]
+        while pending:
+            parent = pending.pop()
+            children = set()
+            task_root = Path(f'/proc/{parent}/task')
+            if not task_root.exists():
+                continue
+            for task in task_root.iterdir():
+                try:
+                    children.update((task / 'children').read_text().split())
+                except OSError:
+                    pass
+            for child in children:
+                owned.append(int(child))
+                pending.append(int(child))
+        sandboxes = []
+        for pid in owned:
+            command = Path(f'/proc/{pid}/comm')
+            try:
+                if command.read_text().strip() == 'bwrap':
+                    sandboxes.append(pid)
+            except OSError:
+                pass
+        self.assertEqual(len(sandboxes), 1)
+        os.kill(sandboxes[0], 9)
+        thread.join(8)
+        self.assertFalse(thread.is_alive())
+        self.assertEqual(outcome['error'].code, 'WORKER_CRASH')
+        self.assertEqual(client_request(self.ipc, request_value('status'))['provider_state'], 'ready')
+        with self.audio.open('rb') as source:
+            result, audio = client_request(self.ipc, request_value('submit', job_id='after-crash',
+                args=self.arguments('speech'), timeout=5), source.fileno())
+        self.assertEqual(result['duration_ms'], 100)
+        self.assertEqual(result['audio']['sha256'], hashlib.sha256(audio).hexdigest())
+        self.assertEqual(client_request(self.ipc, request_value('status'))['provider_state'], 'ready')
+
+    def test_second_client_is_busy_while_a_job_holds_the_worker(self):
+        self.start()
+        outcome = {}
+
+        def hold():
+            try:
+                with self.audio.open('rb') as source:
+                    outcome['result'] = client_request(self.ipc, request_value(
+                        'submit', job_id='hold-job', args=self.arguments('hold'), timeout=8), source.fileno())[0]
+            except Exception as error:
+                outcome['error'] = error
+
+        thread = threading.Thread(target=hold)
+        thread.start()
+        deadline = time.monotonic() + 3
+        while not list(self.jobs.glob('*/holding')) and time.monotonic() < deadline:
+            time.sleep(0.01)
+        self.assertTrue(list(self.jobs.glob('*/holding')))
+        with self.audio.open('rb') as source, self.assertRaises(ProtocolError) as caught:
+            client_request(self.ipc, request_value('submit', job_id='other-job',
+                args=self.arguments('speech'), timeout=2), source.fileno())
+        self.assertEqual(caught.exception.code, 'BUSY')
+        for path in self.jobs.glob('*/holding'):
+            (path.parent / 'release').write_text('1')
+        thread.join(8)
+        self.assertFalse(thread.is_alive())
+        self.assertNotIn('error', outcome)
+        self.assertEqual(outcome['result']['duration_ms'], 100)
+        with self.audio.open('rb') as source:
+            result = client_request(self.ipc, request_value('submit', job_id='after-hold',
+                args=self.arguments('speech'), timeout=5), source.fileno())[0]
+        self.assertEqual(result['duration_ms'], 100)
+        self.assertEqual(client_request(self.ipc, request_value('status'))['provider_state'], 'ready')

@@ -131,3 +131,27 @@ class OwnedCleanupTests(unittest.TestCase):
                     self.fail('unproved grant handed off')
             self.assertEqual(caught.exception.code, 'PROVIDER_UNAVAILABLE')
             self.assertEqual(len(os.listdir('/proc/self/fd')), before)
+
+    def test_lease_refusal_keeps_queue_and_loss_distinct(self):
+        policy = object.__new__(ExecutionPolicy)
+
+        class Refusal(Exception):
+            def __init__(self, code):
+                super().__init__(code)
+                self.code = code
+
+        expected = (
+            ('queue-full', 'BUSY'),
+            ('cancelled', 'CANCELED'),
+            ('deadline', 'DEADLINE_EXCEEDED'),
+            ('lost-lease', 'SUPERVISOR_FAILED'),
+            ('unavailable', 'PROVIDER_UNAVAILABLE'),
+            ('invalid-request', 'INVALID_REQUEST'),
+            ('unknown', 'PROVIDER_UNAVAILABLE'),
+        )
+        for source, code in expected:
+            with self.subTest(source=source):
+                refusal = policy.convert(Refusal(source))
+                self.assertIsInstance(refusal, ProtocolError)
+                self.assertEqual(refusal.code, code)
+                self.assertEqual(str(refusal), 'shared execution lease refused')

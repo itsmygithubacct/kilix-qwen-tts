@@ -74,6 +74,39 @@ def cuda_failure(error: BaseException, torch) -> bool:
     return isinstance(error, RuntimeError) and _BACKEND_FAILURE.match(str(error)) is not None
 
 
+# A narrower split than cuda_failure(). A CUBLAS or cuDNN status, and an
+# NVML line with a trailing location, stay unclassified so an existing
+# post-PCM backend failure remains ENGINE_FAILED. The one CPU retry is
+# unchanged.
+_OOM_TEXT = re.compile(
+    r'^CUDA error: out of memory(?=[.\n]|$)',
+    re.IGNORECASE)
+_DEVICE_LOSS_TEXT = re.compile(
+    r'^(?:CUDA error: (?:no kernel image(?: is available for execution on the device)?'
+    r'|initialization error|driver shutting down'
+    r'|all CUDA-capable devices are busy or unavailable'
+    r'|CUDA-capable device\(s\) is/are busy or unavailable'
+    r'|unknown error)(?=[.\n]|$)'
+    r'|CUDA driver initialization failed(?=[.\n]|$)'
+    r'|NVML_SUCCESS == (?:r|DriverAPI::get\(\)->nvmlInit_v2_\(\)'
+    r'|DriverAPI::get\(\)->nvmlDeviceGetHandleByPciBusId_v2_\(\s*pci_id,\s*&nvml_device\)) INTERNAL ASSERT FAILED(?=[.\n]|$)'
+    r')', re.IGNORECASE)
+
+
+def failure_kind(error: BaseException):
+    """oom or device_loss when the exception is one of those stops, else None."""
+    if type(error).__name__ == "OutOfMemoryError" or isinstance(error, MemoryError):
+        return "oom"
+    if not isinstance(error, RuntimeError):
+        return None
+    text = str(error)
+    if _OOM_TEXT.match(text) is not None:
+        return "oom"
+    if _DEVICE_LOSS_TEXT.match(text) is not None:
+        return "device_loss"
+    return None
+
+
 def release(torch) -> None:
     import gc
     gc.collect()

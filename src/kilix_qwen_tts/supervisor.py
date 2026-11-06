@@ -16,6 +16,21 @@ stopping = False
 CLEANUP_MARKER = b"KILIX_REAPED_V1"
 
 
+def exit_status(returncode, stopping):
+    """Translate a signal death before SystemExit reduces it modulo 256.
+
+    A stop requested of this supervisor stays 130. A negative wait status
+    becomes 128 plus the signal number so the host can see a crash.
+    """
+    if stopping:
+        return 130
+    if type(returncode) is not int:
+        return 125
+    if returncode < 0:
+        return 128 - returncode
+    return returncode
+
+
 def stop(_signal, _frame):
     global stopping
     stopping = True
@@ -115,7 +130,7 @@ def main():
         worker.stdin.close()
         while worker.poll() is None and not stopping:
             time.sleep(0.01)
-        return 130 if stopping else worker.returncode
+        return exit_status(worker.returncode, stopping)
     finally:
         reap_descendants()
         if completion is not None:
