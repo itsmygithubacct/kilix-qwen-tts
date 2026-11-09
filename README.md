@@ -82,7 +82,7 @@ Useful `serve` options: `--installed-asset ID --content-root DIR
 client (kilix-tts, Voicebox, kilix-qwen-tts synthesize)
    |  same-UID SOCK_SEQPACKET, bounded JSON + read-only descriptors
    v
-kilix-qwen-tts serve      licence receipt and byte checks per job
+kilix-qwen-tts serve      byte checks per job (+ licence receipt for Content installs)
    |  sealed memfd bundle, dedicated subreaper supervisor
    v
 bubblewrap namespace      private network/PID, read-only runtime, rlimits
@@ -91,9 +91,10 @@ bubblewrap namespace      private network/PID, read-only runtime, rlimits
 worker: pinned Qwen3-TTS engine -> 24 kHz mono PCM16 WAV descriptor
 ```
 
-The service accepts one job at a time. For each job it checks the licence
-receipt and the installed model bytes against the Kilix Content catalog,
-copies everything the engine will execute into one sealed memory file, and
+The service accepts one job at a time. For each job it checks the model bytes
+against the staged runtime manifest (for a Kilix Content install, also against
+the catalog and a current licence receipt; a locally staged runtime has no
+receipt), copies everything the engine will execute into one sealed memory file, and
 starts a system-Python bootstrap inside bubblewrap that unpacks it to a private
 tmpfs and drops capabilities before importing model code. The result comes back
 as a digest-bound, read-only WAV descriptor. Cancellation, timeouts and crashes
